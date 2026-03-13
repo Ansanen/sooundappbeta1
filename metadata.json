@@ -1,0 +1,5 @@
+{
+  "name": "Soound",
+  "description": "Synchronized music playback across multiple devices. Create a room, share the link, and listen together in perfect sync.",
+  "requestFramePermissions": []
+}
