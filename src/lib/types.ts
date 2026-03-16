@@ -4,4 +4,24 @@ export interface Track {
   artist: string;
   url: string;
   cover: string;
+  duration?: number;
+  source?: 'youtube' | 'upload' | 'default';
+  youtubeId?: string;
+  requestedBy?: string;
+}
+
+export interface RoomUser {
+  socketId: string;
+  name: string;
+  isHost: boolean;
+  userId: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  text: string;
+  userId: string;
+  userName: string;
+  timestamp: number;
+  isSystem?: boolean;
 }
