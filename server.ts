@@ -923,8 +923,14 @@ async function startServer() {
       room.positionAtStart = data.position;
       room.playbackStartedAt = Date.now();
       
-      socket.to(currentRoomId).emit('simple_play', data);
-      console.log(`[SimpleSync] Play at ${data.position.toFixed(2)}s`);
+      // Schedule playback 2s in future so all clients can prepare
+      const serverStartTime = Date.now() + 2000;
+      io.to(currentRoomId).emit('scheduled_play', {
+        position: data.position,
+        serverStartTime,
+        serverTime: Date.now(),
+      });
+      console.log(`[Sync] Play scheduled at +2s, pos=${data.position.toFixed(2)}s`);
     });
 
     socket.on("simple_pause", (data: { position: number }) => {
@@ -934,9 +940,13 @@ async function startServer() {
       
       room.isPlaying = false;
       room.positionAtStart = data.position;
+      room.playbackStartedAt = Date.now();
       
-      socket.to(currentRoomId).emit('simple_pause', data);
-      console.log(`[SimpleSync] Pause at ${data.position.toFixed(2)}s`);
+      io.to(currentRoomId).emit('scheduled_pause', {
+        position: data.position,
+        serverTime: Date.now(),
+      });
+      console.log(`[Sync] Pause at ${data.position.toFixed(2)}s`);
     });
 
     socket.on("simple_seek", (data: { position: number }) => {
@@ -945,8 +955,14 @@ async function startServer() {
       if (!room || socket.id !== room.hostSocketId) return;
       
       room.positionAtStart = data.position;
+      if (room.isPlaying) room.playbackStartedAt = Date.now();
       
-      socket.to(currentRoomId).emit('simple_seek', data);
+      const serverStartTime = Date.now() + 1500;
+      io.to(currentRoomId).emit('scheduled_seek', {
+        position: data.position,
+        serverStartTime,
+        serverTime: Date.now(),
+      });
     });
 
     // === WebRTC Signaling ===
@@ -1096,6 +1112,11 @@ async function startServer() {
         hostName: r.users.get(r.hostSocketId)?.name || 'Unknown',
       }));
     res.json({ rooms: publicRooms });
+  });
+
+  // NTP-style time sync endpoint
+  app.get("/api/time", (_req, res) => {
+    res.json({ serverTime: Date.now() });
   });
 
   app.get("/api/health", (_req, res) => {
@@ -1289,6 +1310,16 @@ async function startServer() {
       res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
     }
   });
+
+  // Heartbeat: broadcast server time + position to active rooms every 5s
+  setInterval(() => {
+    const serverTime = Date.now();
+    for (const [roomId, room] of rooms.entries()) {
+      if (!room.isPlaying) continue;
+      const position = getCurrentPosition(room);
+      io.to(roomId).emit('heartbeat', { serverTime, trackPosition: position });
+    }
+  }, 5000);
 
   httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`🔊 Soound server running on http://0.0.0.0:${PORT}`);

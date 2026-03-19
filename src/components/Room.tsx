@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import useRoom from '../hooks/useRoom';
-import { useUnifiedAudio, AudioMode, AudioStatus } from '../hooks/useUnifiedAudio';
+import { useClockOffset } from '../hooks/useClockOffset';
+import { useAudioSync } from '../hooks/useAudioSync';
+import { getSocket } from '../lib/socket';
 import { Onboarding } from './Onboarding';
 import { RoomHeader } from './room/RoomHeader';
 import { PlayerSection } from './room/PlayerSection';
@@ -134,23 +136,123 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
     }
   }, [isHost, emit]);
 
+  // === New sync engine: NTP clock + Web Audio API ===
+  const { sync: syncClock, serverNow } = useClockOffset();
+  const {
+    loadTrack, schedulePlay, pause: audioPause, checkDrift,
+    unlockAudio, getPosition, getDuration, setVolume, isPlayingRef: audioIsPlayingRef,
+  } = useAudioSync({ serverNow });
+
+  const [syncStatus, setSyncStatus] = useState<string>('idle');
   const [audioStatus, setAudioStatus] = useState<string>('idle');
   const [audioStatusMsg, setAudioStatusMsg] = useState<string | undefined>();
-  
-  // Audio mode: 'sync' (NTP-based) or 'webrtc' (host streams directly)
-  const [audioMode, setAudioMode] = useState<AudioMode>('sync');
-  
-  const { status: syncStatus, volume, setVolume, play, pause, seekTo, unlock, getCurrentPosition } = useUnifiedAudio({
-    roomId,
-    trackUrl: liveUrl,
-    isHost,
-    mode: audioMode,
-    onTimeUpdate: (pos, dur) => { setCurrentTime(pos); setDuration(dur); },
-    onEnded: handleEnded,
-    onStatusChange: (s, msg) => { setAudioStatus(s); setAudioStatusMsg(msg); },
-  });
+  const [volume, setVolumeState] = useState(1);
+  const trackLoadedRef = useRef(false);
+  const positionIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Dummy audioRef for components that need it (PlayerSection etc)
+  // Sync clock on mount
+  useEffect(() => {
+    syncClock().catch(console.error);
+  }, [syncClock]);
+
+  // Position tracking interval
+  useEffect(() => {
+    positionIntervalRef.current = setInterval(() => {
+      const pos = getPosition();
+      const dur = getDuration();
+      if (pos !== null) {
+        setCurrentTime(pos);
+        setDuration(dur);
+      }
+    }, 250);
+    return () => { if (positionIntervalRef.current) clearInterval(positionIntervalRef.current); };
+  }, [getPosition, getDuration]);
+
+  // Load track when liveUrl changes
+  useEffect(() => {
+    if (!liveUrl) {
+      setSyncStatus('idle');
+      trackLoadedRef.current = false;
+      return;
+    }
+
+    setSyncStatus('loading');
+    setAudioStatus('loading');
+    trackLoadedRef.current = false;
+
+    loadTrack(liveUrl).then(() => {
+      trackLoadedRef.current = true;
+      setSyncStatus('ready');
+      setAudioStatus('ready');
+      console.log('[Room] Track loaded and decoded');
+    }).catch(err => {
+      console.error('[Room] Track load error:', err);
+      setSyncStatus('error');
+      setAudioStatus('error');
+      setAudioStatusMsg(err.message);
+    });
+  }, [liveUrl, loadTrack]);
+
+  // Socket events for sync
+  useEffect(() => {
+    const socket = getSocket();
+
+    const handleScheduledPlay = (data: { position: number; serverStartTime: number; serverTime: number }) => {
+      console.log('[Room] scheduled_play:', data);
+      if (!trackLoadedRef.current) {
+        console.warn('[Room] Track not loaded yet, ignoring play');
+        return;
+      }
+      schedulePlay(data.serverStartTime, data.position);
+      setSyncStatus('playing');
+      setAudioStatus('playing');
+    };
+
+    const handleScheduledPause = (data: { position: number; serverTime: number }) => {
+      console.log('[Room] scheduled_pause:', data);
+      audioPause();
+      setSyncStatus('paused');
+      setAudioStatus('paused');
+    };
+
+    const handleScheduledSeek = (data: { position: number; serverStartTime: number; serverTime: number }) => {
+      console.log('[Room] scheduled_seek:', data);
+      if (audioIsPlayingRef.current && trackLoadedRef.current) {
+        schedulePlay(data.serverStartTime, data.position);
+      }
+    };
+
+    const handleHeartbeat = (data: { serverTime: number; trackPosition: number }) => {
+      if (audioIsPlayingRef.current) {
+        checkDrift({ serverTime: data.serverTime, trackPosition: data.trackPosition });
+      }
+    };
+
+    // Also handle legacy sync_play for late joiners
+    const handleSyncPlay = (data: { scheduledTime: number; position: number }) => {
+      console.log('[Room] sync_play (late join):', data);
+      if (!trackLoadedRef.current) return;
+      schedulePlay(data.scheduledTime, data.position);
+      setSyncStatus('playing');
+      setAudioStatus('playing');
+    };
+
+    socket.on('scheduled_play', handleScheduledPlay);
+    socket.on('scheduled_pause', handleScheduledPause);
+    socket.on('scheduled_seek', handleScheduledSeek);
+    socket.on('heartbeat', handleHeartbeat);
+    socket.on('sync_play', handleSyncPlay);
+
+    return () => {
+      socket.off('scheduled_play', handleScheduledPlay);
+      socket.off('scheduled_pause', handleScheduledPause);
+      socket.off('scheduled_seek', handleScheduledSeek);
+      socket.off('heartbeat', handleHeartbeat);
+      socket.off('sync_play', handleSyncPlay);
+    };
+  }, [schedulePlay, audioPause, checkDrift, audioIsPlayingRef]);
+
+  // Dummy audioRef for components that need it
   const audioRef = useRef<HTMLAudioElement>(null);
 
   useEffect(() => {
@@ -166,15 +268,15 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
   useEffect(() => {
     console.log('[Room] Auto-play check - isHost:', isHost, 'syncStatus:', syncStatus, 'currentTrack:', !!currentTrack, 'liveUrl:', !!liveUrl);
     
-    if (isHost && currentTrack && syncStatus === 'ready' && liveUrl) {
+    if (isHost && currentTrack && syncStatus === 'ready' && liveUrl && trackLoadedRef.current) {
       console.log('[Room] Auto-playing track for host...');
-      // Small delay to ensure audio is fully ready
       const timer = setTimeout(() => {
-        play();
+        const socket = getSocket();
+        socket.emit('simple_play', { position: 0 });
       }, 300);
       return () => clearTimeout(timer);
     }
-  }, [isHost, currentTrack, syncStatus, liveUrl, play]);
+  }, [isHost, currentTrack, syncStatus, liveUrl]);
 
   // Track listener's local audio state
   const [localAudioBlocked, setLocalAudioBlocked] = useState(false);
@@ -209,13 +311,13 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
 
     if (isHost) {
       navigator.mediaSession.setActionHandler('play', () => {
-        emit.livePlay(getCurrentPosition());
+        getSocket().emit('simple_play', { position: getPosition() || 0 });
       });
       navigator.mediaSession.setActionHandler('pause', () => {
-        emit.livePause();
+        getSocket().emit('simple_pause', { position: getPosition() || 0 });
       });
       navigator.mediaSession.setActionHandler('nexttrack', queue.length > 0 ? () => emit.playNext() : null);
-      navigator.mediaSession.setActionHandler('previoustrack', () => seekTo(0));
+      navigator.mediaSession.setActionHandler('previoustrack', () => getSocket().emit('simple_seek', { position: 0 }));
     }
 
     return () => {
@@ -232,32 +334,29 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
   // No need for isPlaying-based audio control here
 
   const handlePlayPause = () => {
-    console.log('[Room] handlePlayPause - isHost:', isHost, 'syncStatus:', syncStatus, 'isPlaying:', isPlaying, 'localAudioBlocked:', localAudioBlocked, 'currentTrack:', !!currentTrack);
+    console.log('[Room] handlePlayPause - isHost:', isHost, 'syncStatus:', syncStatus, 'audioPlaying:', audioIsPlayingRef.current);
     
     // Unlock AudioContext on user gesture (mobile requirement)
-    unlock();
+    unlockAudio();
     
     if (!isHost) {
-      // Listener: unlock audio context + play if we have a buffer
-      console.log('[Room] Listener play/pause, syncStatus:', syncStatus);
-      if (syncStatus === 'ready' || syncStatus === 'paused' || localAudioBlocked) {
-        play();
+      // Listener can't control playback — but can unlock audio
+      if (localAudioBlocked) {
         setLocalAudioBlocked(false);
-      } else if (syncStatus === 'playing') {
-        pause();
+        // Request sync to get current position
+        getSocket().emit('request_sync');
       }
       return;
     }
     
-    // Host: use syncStatus (local audio state) instead of isPlaying (server state)
-    // This avoids race conditions when server state hasn't synced yet
-    const isCurrentlyPlaying = syncStatus === 'playing';
-    console.log('[Room] Host play/pause - syncStatus:', syncStatus, 'will call:', isCurrentlyPlaying ? 'pause()' : 'play()');
-    
-    if (isCurrentlyPlaying) {
-      pause();
+    // Host: toggle play/pause
+    const socket = getSocket();
+    if (audioIsPlayingRef.current) {
+      const pos = getPosition() || 0;
+      socket.emit('simple_pause', { position: pos });
     } else {
-      play();
+      const pos = getPosition() || 0;
+      socket.emit('simple_play', { position: pos });
     }
   };
 
@@ -272,12 +371,12 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
         handlePlayPause();
       } else if (e.code === 'ArrowRight' && isHost) {
         e.preventDefault();
-        const t = Math.min(getCurrentPosition() + 10, duration || 0);
-        emit.liveSeek(t);
+        const pos = getPosition() || 0;
+        getSocket().emit('simple_seek', { position: Math.min(pos + 10, duration || 0) });
       } else if (e.code === 'ArrowLeft' && isHost) {
         e.preventDefault();
-        const t = Math.max(getCurrentPosition() - 10, 0);
-        emit.liveSeek(t);
+        const pos = getPosition() || 0;
+        getSocket().emit('simple_seek', { position: Math.max(pos - 10, 0) });
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -287,8 +386,8 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const time = parseFloat(e.target.value);
     if (isHost) {
-      seekTo(time);
-      emit.liveSeek(time);
+      const socket = getSocket();
+      socket.emit('simple_seek', { position: time });
     }
   };
 
@@ -515,41 +614,11 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
           onOpenShareCard={() => setShowShareCard(true)}
         />
 
-        {/* Audio Mode Switcher — Host Only */}
-        {isHost && (
-          <div className="flex items-center justify-center gap-1 mb-4 bg-white/5 rounded-full p-1">
-            <button
-              onClick={() => {
-                setAudioMode('sync');
-                showToast('🔄 Switched to Sync mode');
-              }}
-              className={`px-4 py-2 rounded-full text-xs font-medium transition-all active:scale-95 ${
-                audioMode === 'sync' 
-                  ? 'bg-purple-500 text-white shadow-lg shadow-purple-500/30' 
-                  : 'text-white/50 hover:text-white hover:bg-white/10'
-              }`}
-            >
-              Sync
-            </button>
-            <button
-              onClick={() => {
-                setAudioMode('webrtc');
-                showToast('📡 Switched to WebRTC mode');
-              }}
-              className={`px-4 py-2 rounded-full text-xs font-medium transition-all active:scale-95 ${
-                audioMode === 'webrtc' 
-                  ? 'bg-emerald-500 text-white shadow-lg shadow-emerald-500/30' 
-                  : 'text-white/50 hover:text-white hover:bg-white/10'
-              }`}
-            >
-              WebRTC
-            </button>
-          </div>
-        )}
+        {/* Web Audio sync — no mode switcher needed */}
 
         <PlayerSection
           currentTrack={currentTrack}
-          isPlaying={isHost ? syncStatus === 'playing' : localPlaying}
+          isPlaying={syncStatus === 'playing'}
           currentTime={isHost ? currentTime : liveCurrentTime}
           duration={duration}
           volume={volume}
@@ -558,9 +627,9 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
           audioElement={audioRef.current}
           onPlayPause={handlePlayPause}
           onSeek={handleSeek}
-          onVolumeChange={(e) => setVolume(parseFloat(e.target.value))}
+          onVolumeChange={(e) => { const v = parseFloat(e.target.value); setVolumeState(v); setVolume(v); }}
           onPlayNext={() => emit.playNext()}
-          onPlayPrev={() => seekTo(0)}
+          onPlayPrev={() => getSocket().emit('simple_seek', { position: 0 })}
           onShowToast={showToast}
           onSendReaction={(emoji) => emit.reaction(emoji)}
           onOpenSearch={() => openDrawer('search')}
