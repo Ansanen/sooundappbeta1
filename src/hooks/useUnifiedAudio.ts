@@ -185,7 +185,7 @@ export function useUnifiedAudio({
         duration: audio.duration || 0,
         isPlaying: !audio.paused,
       });
-    }, 500);
+    }, 300); // More frequent updates for tighter sync
 
     return () => clearInterval(interval);
   }, [mode, isHost, socket]);
@@ -212,12 +212,12 @@ export function useUnifiedAudio({
         setStatus('paused');
       }
 
-      // Sync position if drifted > 0.8s
+      // Sync position if drifted > 0.4s (tighter sync)
       if (data.isPlaying && !audio.paused) {
         const drift = Math.abs(audio.currentTime - data.position);
-        if (drift > 0.8) {
-          // Add 300ms latency compensation
-          const target = data.position + 0.3;
+        if (drift > 0.4) {
+          // Add 150ms latency compensation (network delay estimate)
+          const target = data.position + 0.15;
           console.log(`[Sync] Drift ${drift.toFixed(2)}s → seeking to ${target.toFixed(2)}s`);
           audio.currentTime = Math.min(target, audio.duration || target);
           lastSyncTimeRef.current = Date.now();

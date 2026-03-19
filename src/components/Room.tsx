@@ -232,15 +232,15 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
   // No need for isPlaying-based audio control here
 
   const handlePlayPause = () => {
-    console.log('[Room] handlePlayPause - isHost:', isHost, 'isPlaying:', isPlaying, 'syncStatus:', syncStatus, 'localAudioBlocked:', localAudioBlocked, 'currentTrack:', !!currentTrack);
+    console.log('[Room] handlePlayPause - isHost:', isHost, 'syncStatus:', syncStatus, 'isPlaying:', isPlaying, 'localAudioBlocked:', localAudioBlocked, 'currentTrack:', !!currentTrack);
     
     // Unlock AudioContext on user gesture (mobile requirement)
     unlock();
     
     if (!isHost) {
       // Listener: unlock audio context + play if we have a buffer
-      console.log('[Room] Listener play/pause');
-      if (syncStatus === 'ready' || localAudioBlocked) {
+      console.log('[Room] Listener play/pause, syncStatus:', syncStatus);
+      if (syncStatus === 'ready' || syncStatus === 'paused' || localAudioBlocked) {
         play();
         setLocalAudioBlocked(false);
       } else if (syncStatus === 'playing') {
@@ -249,9 +249,12 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
       return;
     }
     
-    // Host: call play/pause directly (handles both sync and webrtc modes internally)
-    console.log('[Room] Host play/pause - will call:', isPlaying ? 'pause()' : 'play()');
-    if (isPlaying) {
+    // Host: use syncStatus (local audio state) instead of isPlaying (server state)
+    // This avoids race conditions when server state hasn't synced yet
+    const isCurrentlyPlaying = syncStatus === 'playing';
+    console.log('[Room] Host play/pause - syncStatus:', syncStatus, 'will call:', isCurrentlyPlaying ? 'pause()' : 'play()');
+    
+    if (isCurrentlyPlaying) {
       pause();
     } else {
       play();
@@ -546,7 +549,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
 
         <PlayerSection
           currentTrack={currentTrack}
-          isPlaying={isHost ? isPlaying : localPlaying}
+          isPlaying={isHost ? syncStatus === 'playing' : localPlaying}
           currentTime={isHost ? currentTime : liveCurrentTime}
           duration={duration}
           volume={volume}
