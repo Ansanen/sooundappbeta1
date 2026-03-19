@@ -669,10 +669,28 @@ async function startServer() {
       room.positionAtStart = data.position;
       room.playbackStartedAt = Date.now();
 
-      // Broadcast to all listeners
+      // Broadcast to all listeners (both formats for compatibility)
       socket.to(currentRoomId!).emit("position_broadcast", {
         position: data.position,
         timestamp: Date.now(),
+      });
+    });
+    
+    // === Host broadcasts time (from useUnifiedAudio) ===
+    socket.on("host_time", (data: { position: number; duration: number; isPlaying: boolean }) => {
+      const room = getRoom();
+      if (!room || socket.id !== room.hostSocketId) return;
+
+      // Store host's current position
+      room.positionAtStart = data.position;
+      room.playbackStartedAt = Date.now();
+      room.isPlaying = data.isPlaying;
+
+      // Broadcast to all listeners
+      socket.to(currentRoomId!).emit("host_time", {
+        position: data.position,
+        duration: data.duration,
+        isPlaying: data.isPlaying,
       });
     });
 
@@ -687,6 +705,17 @@ async function startServer() {
       
       // Also send full room state
       socket.emit("sync", buildSyncPayload(room));
+      
+      // If room is playing, send sync_play command so listener starts
+      if (room.isPlaying && currentRoomId) {
+        const activeStream = liveStreams.get(currentRoomId);
+        if (activeStream && activeStream.isPlaying) {
+          const currentPos = getCurrentByte(activeStream) / activeStream.byteRate;
+          const scheduledTime = Date.now() + 500; // Start in 500ms
+          socket.emit('sync_play', { scheduledTime, position: currentPos });
+          console.log(`[Sync] request_sync → sync_play at pos ${currentPos.toFixed(1)}s`);
+        }
+      }
     });
     
     // === Chat (rate limited: 5 messages per 5s per socket) ===

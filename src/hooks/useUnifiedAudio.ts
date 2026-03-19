@@ -114,6 +114,17 @@ export function useUnifiedAudio({
       console.log('[Audio] Track ready, duration:', audio.duration);
       durationRef.current = audio.duration || 0;
       setStatus('ready');
+      
+      // For listeners: request sync if we don't start playing within 2s
+      // This handles late join when sync_play was missed
+      if (!isHost) {
+        setTimeout(() => {
+          if (audio && audio.paused && audio.src) {
+            console.log('[Audio] Listener: requesting sync (no play command received)');
+            socket.emit('request_sync');
+          }
+        }, 2000);
+      }
     };
 
     const onError = (e: Event) => {
@@ -246,16 +257,70 @@ export function useUnifiedAudio({
       audio.currentTime = data.position;
     };
 
+    // Handle sync_play from server (used for late joiners + scheduled playback)
+    const handleSyncPlay = (data: { scheduledTime: number; position: number }) => {
+      const audio = audioRef.current;
+      if (!audio || !audio.src) {
+        console.log('[Sync] sync_play received but no audio loaded yet');
+        return;
+      }
+      
+      const now = Date.now();
+      const delay = data.scheduledTime - now;
+      
+      console.log(`[Sync] sync_play: pos=${data.position.toFixed(1)}s, scheduled in ${delay}ms`);
+      
+      const startPlayback = () => {
+        // Adjust position for time elapsed since scheduled time
+        const elapsed = Math.max(0, (Date.now() - data.scheduledTime) / 1000);
+        const targetPos = data.position + elapsed;
+        
+        audio.currentTime = Math.min(targetPos, audio.duration || targetPos);
+        audio.play().then(() => {
+          isPlayingRef.current = true;
+          setStatus('playing');
+          console.log(`[Sync] sync_play started at ${audio.currentTime.toFixed(1)}s`);
+        }).catch((e) => {
+          console.warn('[Sync] sync_play autoplay blocked:', e.message);
+          setStatus('ready', 'Tap to play');
+        });
+      };
+      
+      if (delay > 50) {
+        // Schedule playback
+        setTimeout(startPlayback, delay);
+      } else {
+        // Start immediately
+        startPlayback();
+      }
+    };
+
+    // Handle sync_pause from server
+    const handleSyncPause = (data: { position: number }) => {
+      const audio = audioRef.current;
+      if (!audio) return;
+      
+      console.log('[Sync] sync_pause at', data.position);
+      audio.pause();
+      audio.currentTime = data.position;
+      isPlayingRef.current = false;
+      setStatus('paused');
+    };
+
     socket.on('host_time', handleHostTime);
     socket.on('simple_play', handleSimplePlay);
     socket.on('simple_pause', handleSimplePause);
     socket.on('simple_seek', handleSimpleSeek);
+    socket.on('sync_play', handleSyncPlay);
+    socket.on('sync_pause', handleSyncPause);
 
     return () => {
       socket.off('host_time', handleHostTime);
       socket.off('simple_play', handleSimplePlay);
       socket.off('simple_pause', handleSimplePause);
       socket.off('simple_seek', handleSimpleSeek);
+      socket.off('sync_play', handleSyncPlay);
+      socket.off('sync_pause', handleSyncPause);
     };
   }, [mode, isHost, socket, setStatus]);
 
