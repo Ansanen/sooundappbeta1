@@ -677,7 +677,7 @@ async function startServer() {
     });
     
     // === Host broadcasts time (from useUnifiedAudio) ===
-    socket.on("host_time", (data: { position: number; duration: number; isPlaying: boolean }) => {
+    socket.on("host_time", (data: { position: number; duration: number; isPlaying: boolean; timestamp?: number }) => {
       const room = getRoom();
       if (!room || socket.id !== room.hostSocketId) return;
 
@@ -686,11 +686,12 @@ async function startServer() {
       room.playbackStartedAt = Date.now();
       room.isPlaying = data.isPlaying;
 
-      // Broadcast to all listeners
+      // Broadcast to all listeners — pass through timestamp for latency calc
       socket.to(currentRoomId!).emit("host_time", {
         position: data.position,
         duration: data.duration,
         isPlaying: data.isPlaying,
+        timestamp: data.timestamp || Date.now(),
       });
     });
 

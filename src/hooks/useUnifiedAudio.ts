@@ -184,8 +184,9 @@ export function useUnifiedAudio({
         position: audio.currentTime,
         duration: audio.duration || 0,
         isPlaying: !audio.paused,
+        timestamp: Date.now(),
       });
-    }, 300); // More frequent updates for tighter sync
+    }, 500); // Every 500ms
 
     return () => clearInterval(interval);
   }, [mode, isHost, socket]);
@@ -194,12 +195,17 @@ export function useUnifiedAudio({
   useEffect(() => {
     if (mode !== 'sync' || isHost) return;
 
-    const handleHostTime = (data: { position: number; duration: number; isPlaying: boolean }) => {
+    const handleHostTime = (data: { position: number; duration: number; isPlaying: boolean; timestamp?: number }) => {
       const audio = audioRef.current;
       if (!audio || !audio.src) return;
 
+      // Calculate host position accounting for network delay
+      const networkDelay = data.timestamp ? (Date.now() - data.timestamp) / 1000 : 0.1;
+      const estimatedHostPos = data.position + networkDelay;
+
       // Handle play/pause state
       if (data.isPlaying && audio.paused) {
+        audio.currentTime = estimatedHostPos;
         audio.play().then(() => {
           isPlayingRef.current = true;
           setStatus('playing');
@@ -212,14 +218,12 @@ export function useUnifiedAudio({
         setStatus('paused');
       }
 
-      // Sync position if drifted > 0.4s (tighter sync)
+      // Sync position if drifted > 0.5s
       if (data.isPlaying && !audio.paused) {
-        const drift = Math.abs(audio.currentTime - data.position);
-        if (drift > 0.4) {
-          // Add 150ms latency compensation (network delay estimate)
-          const target = data.position + 0.15;
-          console.log(`[Sync] Drift ${drift.toFixed(2)}s → seeking to ${target.toFixed(2)}s`);
-          audio.currentTime = Math.min(target, audio.duration || target);
+        const drift = Math.abs(audio.currentTime - estimatedHostPos);
+        if (drift > 0.5) {
+          console.log(`[Sync] Drift ${drift.toFixed(2)}s → seeking to ${estimatedHostPos.toFixed(2)}s (net delay: ${(networkDelay*1000).toFixed(0)}ms)`);
+          audio.currentTime = Math.min(estimatedHostPos, audio.duration || estimatedHostPos);
           lastSyncTimeRef.current = Date.now();
         }
       }
@@ -607,12 +611,7 @@ export function useUnifiedAudio({
   }, []);
 
   const unlock = useCallback(() => {
-    // Unlock HTML5 audio
-    const audio = audioRef.current;
-    if (audio) {
-      audio.play().then(() => audio.pause()).catch(() => {});
-    }
-    // Unlock AudioContext
+    // Only unlock AudioContext — don't touch HTML5 audio (play+pause breaks state)
     if (audioCtxRef.current?.state === 'suspended') {
       audioCtxRef.current.resume();
     }
