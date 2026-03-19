@@ -555,6 +555,12 @@ export function useUnifiedAudio({
         return;
       }
 
+      // Prevent duplicate pause calls
+      if (audio.paused && !isPlayingRef.current) {
+        console.log('[Audio] pause() - already paused, skipping');
+        return;
+      }
+      
       console.log('[Audio] pause() - pausing at', audio.currentTime);
       audio.pause();
       isPlayingRef.current = false;
