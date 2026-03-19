@@ -4,7 +4,6 @@ export type AudioStatus = 'idle' | 'loading' | 'buffering' | 'playing' | 'paused
 
 interface AudioPlayerOptions {
   liveUrl: string | null;
-  initialSeekTo?: number;     // Seek to this position after loading (for late joiners)
   isPlaying: boolean;
   isHost: boolean;
   onEnded: () => void;
@@ -15,7 +14,6 @@ interface AudioPlayerOptions {
 
 export const useAudioPlayer = ({
   liveUrl,
-  initialSeekTo,
   isPlaying,
   isHost,
   onEnded,
@@ -26,9 +24,6 @@ export const useAudioPlayer = ({
   const audioRef = useRef<HTMLAudioElement>(null);
   const [volume, setVolumeState] = useState(1);
   const [status, setStatusState] = useState<AudioStatus>('idle');
-  const isLocalAction = useRef(false);
-  const initialSeekRef = useRef(initialSeekTo);
-  initialSeekRef.current = initialSeekTo;
 
   const onStatusChangeRef = useRef(onStatusChange);
   onStatusChangeRef.current = onStatusChange;
@@ -41,34 +36,28 @@ export const useAudioPlayer = ({
   const play = useCallback(() => {
     const audio = audioRef.current;
     if (!audio) return;
-    isLocalAction.current = true;
     audio.play()
-      .then(() => { setStatus('playing'); })
+      .then(() => setStatus('playing'))
       .catch(e => {
         if (e.name === 'NotAllowedError') {
-          setStatus('paused', 'Tap play to listen');
+          setStatus('paused', 'Tap to listen');
         } else {
           setStatus('error', 'Playback failed');
         }
-      })
-      .finally(() => { setTimeout(() => { isLocalAction.current = false; }, 200); });
+      });
   }, [setStatus]);
 
   const pause = useCallback(() => {
     const audio = audioRef.current;
     if (!audio) return;
-    isLocalAction.current = true;
     audio.pause();
     setStatus('paused');
-    setTimeout(() => { isLocalAction.current = false; }, 200);
   }, [setStatus]);
 
   const seekTo = useCallback((time: number) => {
     const audio = audioRef.current;
     if (!audio) return;
-    isLocalAction.current = true;
-    audio.currentTime = time;
-    setTimeout(() => { isLocalAction.current = false; }, 200);
+    try { audio.currentTime = time; } catch {}
   }, []);
 
   const setVolume = useCallback((vol: number) => {
@@ -76,7 +65,7 @@ export const useAudioPlayer = ({
     if (audioRef.current) audioRef.current.volume = vol;
   }, []);
 
-  // === Live stream loading ===
+  // Load audio when URL changes
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio || !liveUrl) {
@@ -84,35 +73,20 @@ export const useAudioPlayer = ({
       return;
     }
 
-    console.log('[Audio] Loading live stream:', liveUrl);
-    setStatus('loading', 'Connecting to stream...');
-
+    console.log('[Audio] Loading:', liveUrl);
+    setStatus('loading', 'Loading track...');
     audio.src = liveUrl;
     audio.load();
 
     const onCanPlay = () => {
-      console.log('[Audio] Live stream ready');
-      // Seek to current position for late joiners
-      const seekPos = initialSeekRef.current;
-      if (seekPos && seekPos > 1) {
-        console.log(`[Audio] Seeking to ${seekPos.toFixed(1)}s`);
-        audio.currentTime = seekPos;
-      }
-      audio.play()
-        .then(() => setStatus('playing'))
-        .catch(e => {
-          if (e.name === 'NotAllowedError') {
-            setStatus('paused', 'Tap play to listen');
-          } else {
-            setStatus('error', 'Playback failed');
-          }
-        });
+      console.log('[Audio] Ready (loaded, waiting for sync event to play)');
+      setStatus('paused', 'Ready');
+      // Do NOT auto-play — sync_play event will trigger play at the right moment
     };
 
-    const onError = (e: Event) => {
-      const mediaErr = audio.error;
-      console.error('[Audio] Stream error:', mediaErr?.code, mediaErr?.message);
-      setStatus('error', 'Stream error — try again');
+    const onError = () => {
+      console.error('[Audio] Error:', audio.error?.code, audio.error?.message);
+      setStatus('error', 'Failed to load');
     };
 
     const onWaiting = () => setStatus('buffering', 'Buffering...');
@@ -131,32 +105,21 @@ export const useAudioPlayer = ({
     };
   }, [liveUrl, setStatus]);
 
-  // === Audio element event listeners (time, duration, ended) ===
+  // Time/duration/ended
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
-
-    const handleTimeUpdate = () => onTimeUpdate(audio.currentTime);
-    const handleLoaded = () => onLoadedMetadata(audio.duration);
-
-    audio.addEventListener('timeupdate', handleTimeUpdate);
-    audio.addEventListener('loadedmetadata', handleLoaded);
+    const onTime = () => onTimeUpdate(audio.currentTime);
+    const onMeta = () => onLoadedMetadata(audio.duration);
+    audio.addEventListener('timeupdate', onTime);
+    audio.addEventListener('loadedmetadata', onMeta);
     audio.addEventListener('ended', onEnded);
-
     return () => {
-      audio.removeEventListener('timeupdate', handleTimeUpdate);
-      audio.removeEventListener('loadedmetadata', handleLoaded);
+      audio.removeEventListener('timeupdate', onTime);
+      audio.removeEventListener('loadedmetadata', onMeta);
       audio.removeEventListener('ended', onEnded);
     };
   }, [onEnded, onTimeUpdate, onLoadedMetadata]);
 
-  return {
-    audioRef,
-    volume,
-    setVolume,
-    play,
-    pause,
-    seekTo,
-    status,
-  };
+  return { audioRef, volume, setVolume, play, pause, seekTo, status };
 };

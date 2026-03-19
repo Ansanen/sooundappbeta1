@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { PaperAirplaneIcon } from '@heroicons/react/24/solid';
+import { motion, AnimatePresence } from 'motion/react';
+import { Send } from 'lucide-react';
 import { ChatMessage } from '../../lib/types';
 
 interface ChatPanelProps {
@@ -32,52 +32,52 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ messages, onSend, currentUserId }
     }
   };
 
-  const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
       handleSend();
     }
   };
 
   return (
-    <div className="flex flex-col h-full bg-gray-900 text-white">
-      <div className="flex-1 p-4 overflow-y-auto">
-        <div className="space-y-4">
+    <div className="flex flex-col h-full text-white">
+      <div className="flex-1 p-4 overflow-y-auto custom-scrollbar">
+        <div className="space-y-3">
           <AnimatePresence initial={false}>
             {messages.map((msg) => (
               <motion.div
                 key={msg.id}
                 layout
-                initial={{ opacity: 0, scale: 0.8, y: 50 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.8, transition: { duration: 0.2 } }}
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, transition: { duration: 0.15 } }}
                 className={`flex flex-col ${
                   msg.userId === currentUserId ? 'items-end' : 'items-start'
                 }`}
               >
                 {msg.isSystem ? (
                   <div className="w-full text-center my-2">
-                    <p className="text-xs text-gray-400 italic">{msg.text}</p>
+                    <p className="text-xs text-white/30 font-display">{msg.text}</p>
                   </div>
                 ) : (
                   <div
-                    className={`flex flex-col max-w-xs md:max-w-md lg:max-w-lg ${
+                    className={`flex flex-col max-w-[85%] ${
                       msg.userId === currentUserId ? 'items-end' : 'items-start'
                     }`}
                   >
-                    <div className="flex items-center space-x-2">
+                    <div className="flex items-center gap-2 mb-1">
                        {msg.userId !== currentUserId && (
-                        <span className="text-xs font-bold text-gray-300">{msg.userName}</span>
+                        <span className="text-xs font-display font-bold text-white/60">{msg.userName}</span>
                       )}
-                      <span className="text-xs text-gray-500">{formatTimestamp(msg.timestamp)}</span>
+                      <span className="text-[10px] text-white/25">{formatTimestamp(msg.timestamp)}</span>
                     </div>
                     <div
-                      className={`px-4 py-2 rounded-lg mt-1 ${
+                      className={`px-4 py-2.5 rounded-2xl ${
                         msg.userId === currentUserId
-                          ? 'bg-blue-600 rounded-br-none'
-                          : 'bg-gray-700 rounded-bl-none'
+                          ? 'bg-white/15 rounded-br-sm'
+                          : 'bg-white/5 rounded-bl-sm border border-white/5'
                       }`}
                     >
-                      <p className="text-sm">{msg.text}</p>
+                      <p className="text-sm font-display">{msg.text}</p>
                     </div>
                   </div>
                 )}
@@ -87,22 +87,22 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ messages, onSend, currentUserId }
         </div>
         <div ref={messagesEndRef} />
       </div>
-      <div className="p-4 bg-gray-800 border-t border-gray-700">
-        <div className="flex items-center space-x-2">
+      <div className="p-3 border-t border-white/5">
+        <div className="flex items-center gap-2">
           <input
             type="text"
             value={text}
             onChange={(e) => setText(e.target.value)}
-            onKeyPress={handleKeyPress}
+            onKeyDown={handleKeyDown}
             placeholder="Type a message..."
-            className="flex-1 bg-gray-700 rounded-full px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="flex-1 bg-white/5 border border-white/10 rounded-2xl px-4 py-2.5 text-sm font-display focus:outline-none focus:border-white/20 transition-colors placeholder:text-white/25"
           />
           <button
             onClick={handleSend}
-            className="bg-blue-600 text-white rounded-full p-2 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+            className="w-10 h-10 rounded-full bg-white text-black flex items-center justify-center hover:bg-gray-200 transition-colors disabled:opacity-30 disabled:cursor-not-allowed btn-press shrink-0"
             disabled={!text.trim()}
           >
-            <PaperAirplaneIcon className="h-5 w-5" />
+            <Send className="w-4 h-4" />
           </button>
         </div>
       </div>

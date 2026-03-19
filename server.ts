@@ -1,24 +1,108 @@
 import express from "express";
+import multer from "multer";
+import { randomUUID } from "crypto";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import https from "https";
 import path from "path";
-import { execSync, exec } from "child_process";
+import fs from "fs";
+import { execFile, exec } from "child_process";
 import { nanoid } from "nanoid";
 
-const DENO_PATH = "/root/.deno/bin/deno";
-const YT_DLP = "/usr/local/bin/yt-dlp";
+const DENO_PATH = process.env.DENO_PATH || "/root/.deno/bin/deno";
+const YT_DLP = process.env.YT_DLP_PATH || "/usr/local/bin/yt-dlp";
+
+// Simple in-memory rate limiter
+const rateLimiter = new Map<string, { count: number; resetAt: number }>();
+function checkRateLimit(key: string, maxRequests: number, windowMs: number): boolean {
+  const now = Date.now();
+  const entry = rateLimiter.get(key);
+  if (!entry || now > entry.resetAt) {
+    rateLimiter.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (entry.count >= maxRequests) return false;
+  entry.count++;
+  return true;
+}
+
+// Clean up rate limiter every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimiter) {
+    if (now > entry.resetAt) rateLimiter.delete(key);
+  }
+}, 5 * 60 * 1000);
+
+/** Sanitize string for safe use (strip shell-dangerous chars) */
+function sanitizeInput(str: string, maxLen = 200): string {
+  return str.slice(0, maxLen).replace(/[^\w\s\-.',"!?()&+:;@#%/\\áéíóúñüöäàèìòùâêîôûëïãõ]/gi, '').trim();
+}
 
 async function startServer() {
   const app = express();
   const httpServer = createServer(app);
   const io = new Server(httpServer, {
     cors: { origin: "*", methods: ["GET", "POST"] },
-    pingInterval: 3000,
-    pingTimeout: 8000,
+    pingInterval: 10000,
+    pingTimeout: 20000,
+    transports: ["websocket", "polling"],
+    allowUpgrades: true,
   });
 
   const PORT = parseInt(process.env.PORT || "3463");
+
+  // ===================== FILE UPLOAD =====================
+  const uploadDir = path.join(process.cwd(), "uploads");
+  if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+  const storage = multer.diskStorage({
+    destination: uploadDir,
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname);
+      cb(null, `${randomUUID()}${ext}`);
+    },
+  });
+  const upload = multer({
+    storage,
+    limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max
+    fileFilter: (_req, file, cb) => {
+      if (file.mimetype.startsWith("audio/")) {
+        cb(null, true);
+      } else {
+        cb(new Error("Only audio files allowed"));
+      }
+    },
+  });
+
+  // Uploaded files metadata (in-memory, cleared on restart)
+  const uploadedFiles = new Map<string, { path: string; originalName: string; duration?: number }>();
+
+  // Upload endpoint
+  app.post("/api/upload", upload.single("audio"), (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+    const fileId = path.basename(req.file.filename, path.extname(req.file.filename));
+    uploadedFiles.set(fileId, {
+      path: req.file.path,
+      originalName: req.file.originalname,
+    });
+    res.json({
+      id: fileId,
+      title: req.file.originalname.replace(/\.[^.]+$/, ""),
+      url: `/api/uploaded/${fileId}`,
+    });
+  });
+
+  // Serve uploaded files
+  app.get("/api/uploaded/:id", (req, res) => {
+    const file = uploadedFiles.get(req.params.id);
+    if (!file || !fs.existsSync(file.path)) {
+      return res.status(404).send("File not found");
+    }
+    res.sendFile(file.path);
+  });
 
   // ===================== TYPES =====================
   interface ChatMessage {
@@ -64,6 +148,12 @@ async function startServer() {
     isPrivate: boolean;
     password?: string;
     allowGuestQueue: boolean;
+    // WebRTC mode
+    webrtcHostPeerId?: string;
+    // Radio mode
+    radioPlaying: boolean;
+    radioPosition: number;
+    radioStartTime: number;
   }
 
   const rooms = new Map<string, RoomState>();
@@ -81,10 +171,87 @@ async function startServer() {
     playStartByte: number;
     isLoading: boolean;
     loadError: string | null;
-    clients: Map<string, { res: any; intervalId: any }>;
+    clients: Map<string, { res: any; interval: any; byteOffset: number }>;
   }
 
   const liveStreams = new Map<string, LiveStream>();
+  
+  // ===================== AUDIO BROADCASTER (SCALABILITY) =====================
+  // Efficient broadcasting to 50-200+ listeners per room
+  class AudioBroadcaster {
+    private roomId: string;
+    private listeners: Set<string> = new Set();
+    private chunkBuffer: Buffer[] = [];
+    private maxChunks = 50; // ~1 second of 20ms chunks
+    private currentSeq = 0;
+    
+    constructor(roomId: string) {
+      this.roomId = roomId;
+    }
+    
+    addListener(socketId: string): void {
+      this.listeners.add(socketId);
+      console.log(`[Broadcaster] ${this.roomId}: Added listener ${socketId}, total: ${this.listeners.size}`);
+    }
+    
+    removeListener(socketId: string): void {
+      this.listeners.delete(socketId);
+      console.log(`[Broadcaster] ${this.roomId}: Removed listener ${socketId}, total: ${this.listeners.size}`);
+    }
+    
+    getListenerCount(): number {
+      return this.listeners.size;
+    }
+    
+    // Broadcast audio chunk to all listeners efficiently
+    broadcastChunk(chunk: Buffer, timestamp: number): void {
+      if (this.listeners.size === 0) return;
+      
+      // Create header: seq(4) + timestamp(8) + length(4)
+      const header = Buffer.alloc(16);
+      header.writeUInt32LE(this.currentSeq++, 0);
+      header.writeDoubleLE(timestamp, 4);
+      header.writeUInt32LE(chunk.length, 12);
+      
+      const packet = Buffer.concat([header, chunk]);
+      
+      // Store in buffer for late joiners
+      this.chunkBuffer.push(packet);
+      if (this.chunkBuffer.length > this.maxChunks) {
+        this.chunkBuffer.shift();
+      }
+      
+      // Broadcast via Socket.IO room (efficient)
+      io.to(this.roomId).emit('audio_chunk', packet);
+    }
+    
+    // Send buffered chunks to late joiner
+    sendBufferedChunks(socketId: string): void {
+      const socket = io.sockets.sockets.get(socketId);
+      if (!socket) return;
+      
+      for (const chunk of this.chunkBuffer) {
+        socket.emit('audio_chunk', chunk);
+      }
+    }
+    
+    clear(): void {
+      this.listeners.clear();
+      this.chunkBuffer = [];
+      this.currentSeq = 0;
+    }
+  }
+  
+  const broadcasters = new Map<string, AudioBroadcaster>();
+  
+  function getBroadcaster(roomId: string): AudioBroadcaster {
+    let broadcaster = broadcasters.get(roomId);
+    if (!broadcaster) {
+      broadcaster = new AudioBroadcaster(roomId);
+      broadcasters.set(roomId, broadcaster);
+    }
+    return broadcaster;
+  }
 
   function getCurrentByte(stream: LiveStream): number {
     if (!stream.isPlaying || !stream.buffer) return stream.playStartByte;
@@ -98,18 +265,40 @@ async function startServer() {
       trackId: stream.trackId,
       duration: stream.duration,
       url: `/api/live/${stream.roomId}`,
-      currentTime: getCurrentByte(stream) / stream.byteRate,
+      currentTime: 0,
     });
+    // Schedule synchronized play 2 seconds after track is ready
+    // This gives all clients time to load the audio file
+    const scheduledTime = Date.now() + 2000;
+    io.to(stream.roomId).emit('sync_play', { scheduledTime, position: 0 });
+    console.log(`[Sync] New track → sync_play scheduled at +2s`);
   }
 
+  // Track buffer cache — don't re-download same track
+  const trackCache = new Map<string, Buffer>();
+  const TRACK_CACHE_MAX = 20;
+
   async function downloadAndConvert(videoId: string): Promise<Buffer> {
+    // Check cache first
+    const cached = trackCache.get(videoId);
+    if (cached) {
+      console.log(`[Live] Cache hit for ${videoId} (${(cached.length / 1024 / 1024).toFixed(1)}MB)`);
+      return cached;
+    }
+
     return new Promise((resolve, reject) => {
       const env = { ...process.env, PATH: `/root/.deno/bin:${process.env.PATH}` };
       const cmd = `${YT_DLP} -o - -f "bestaudio" "https://www.youtube.com/watch?v=${videoId}" 2>/dev/null | /usr/bin/ffmpeg -i pipe:0 -f mp3 -ab 192k -v quiet pipe:1`;
       exec(cmd, { maxBuffer: 50 * 1024 * 1024, timeout: 60000, env, encoding: 'buffer' }, (err, stdout) => {
         if (err) { reject(new Error(`Failed to load track: ${err.message}`)); return; }
         if (!stdout || stdout.length < 1000) { reject(new Error('Empty audio output')); return; }
-        console.log(`[Live] Track loaded: ${(stdout.length / 1024 / 1024).toFixed(1)}MB MP3`);
+        console.log(`[Live] Track downloaded: ${(stdout.length / 1024 / 1024).toFixed(1)}MB MP3`);
+        // Evict oldest if cache full
+        if (trackCache.size >= TRACK_CACHE_MAX) {
+          const oldest = trackCache.keys().next().value;
+          if (oldest) trackCache.delete(oldest);
+        }
+        trackCache.set(videoId, stdout);
         resolve(stdout);
       });
     });
@@ -127,7 +316,13 @@ async function startServer() {
     stream.trackId = videoId;
     io.to(roomId).emit('live_status', { status: 'loading', trackId: videoId });
     try {
-      const mp3Buffer = await downloadAndConvert(videoId);
+      let mp3Buffer: Buffer;
+      try {
+        mp3Buffer = await downloadAndConvert(videoId);
+      } catch (firstErr: any) {
+        console.warn(`[Live] First download attempt failed: ${firstErr.message}, retrying...`);
+        mp3Buffer = await downloadAndConvert(videoId);
+      }
       stream.buffer = mp3Buffer;
       stream.duration = mp3Buffer.length / stream.byteRate;
       stream.isLoading = false;
@@ -205,9 +400,9 @@ async function startServer() {
       messages: room.messages,
       isPrivate: room.isPrivate,
       allowGuestQueue: room.allowGuestQueue,
-      liveStreamUrl: liveStreams.has(room.roomId) && liveStreams.get(room.roomId)!.buffer 
-        ? `/api/live/${room.roomId}` : null,
-      liveStreamDuration: liveStreams.has(room.roomId) ? liveStreams.get(room.roomId)!.duration : 0,
+      liveStreamUrl: liveStreams.has(room.id) && liveStreams.get(room.id)!.buffer
+        ? `/api/live/${room.id}` : null,
+      liveStreamDuration: liveStreams.has(room.id) ? liveStreams.get(room.id)!.duration : 0,
     };
   }
 
@@ -241,42 +436,50 @@ async function startServer() {
     });
   }
 
-  /** Search YouTube via yt-dlp */
+  /** Search YouTube via yt-dlp (using execFile for safety — no shell injection) */
   async function searchYouTube(query: string, limit = 10): Promise<any[]> {
-    return new Promise((resolve, reject) => {
+    const safeQuery = sanitizeInput(query, 150);
+    if (!safeQuery) return [];
+
+    return new Promise((resolve) => {
       const env = { ...process.env, PATH: `${path.dirname(DENO_PATH)}:${process.env.PATH}` };
-      exec(
-        `${YT_DLP} --dump-json --flat-playlist --no-download "ytsearch${limit}:${query.replace(/"/g, '\\"')}"`,
-        { timeout: 20000, maxBuffer: 5 * 1024 * 1024, env },
-        (err, stdout) => {
-          if (err) {
-            console.error("Search error:", err.message);
-            resolve([]);
-            return;
-          }
-          try {
-            const results = stdout.trim().split("\n").filter(Boolean).map(line => {
-              const j = JSON.parse(line);
-              return {
-                id: j.id,
-                title: j.title || "Unknown",
-                artist: j.uploader || j.channel || "Unknown",
-                duration: j.duration || 0,
-                cover: j.thumbnail || j.thumbnails?.[0]?.url || `https://img.youtube.com/vi/${j.id}/hqdefault.jpg`,
-                youtubeId: j.id,
-              };
-            });
-            resolve(results);
-          } catch (e) {
-            console.error("Parse error:", e);
-            resolve([]);
-          }
+      const args = [
+        '--dump-json',
+        '--flat-playlist',
+        '--no-download',
+        `ytsearch${limit}:${safeQuery}`,
+      ];
+      execFile(YT_DLP, args, { timeout: 20000, maxBuffer: 5 * 1024 * 1024, env }, (err, stdout) => {
+        if (err) {
+          console.error("Search error:", err.message);
+          resolve([]);
+          return;
         }
-      );
+        try {
+          const results = stdout.trim().split("\n").filter(Boolean).map(line => {
+            const j = JSON.parse(line);
+            return {
+              id: j.id,
+              title: j.title || "Unknown",
+              artist: j.uploader || j.channel || "Unknown",
+              duration: j.duration || 0,
+              cover: j.thumbnail || j.thumbnails?.[0]?.url || `https://img.youtube.com/vi/${j.id}/hqdefault.jpg`,
+              youtubeId: j.id,
+            };
+          });
+          resolve(results);
+        } catch (e) {
+          console.error("Parse error:", e);
+          resolve([]);
+        }
+      });
     });
   }
 
   // ===================== SOCKET.IO =====================
+
+  // Track RTT per socket for sync scheduling
+  const socketRTT = new Map<string, number>();
 
   io.on("connection", (socket) => {
     console.log(`[+] ${socket.id} connected`);
@@ -289,6 +492,22 @@ async function startServer() {
         clientTime,
         serverTime: Date.now(),
       });
+    });
+    
+    // === RTT measurement for precise sync ===
+    socket.on("ntp_ping", (data: { t0: number }) => {
+      const rtt = Date.now() - data.t0;
+      socketRTT.set(socket.id, rtt);
+      socket.emit("ntp_pong", { t0: data.t0, serverTime: Date.now() });
+    });
+    
+    // === Phase-coherent time sync (NTP-like intersection algorithm) ===
+    // Used by time-sync.worker.ts for high-precision clock synchronization
+    socket.on("sync_ping", (data: { t0: number }) => {
+      const t1 = performance.timeOrigin + performance.now();
+      // Minimal processing between t1 and t2
+      const t2 = performance.timeOrigin + performance.now();
+      socket.emit("sync_pong", { t0: data.t0, t1, t2 });
     });
 
     // === Join room ===
@@ -329,6 +548,9 @@ async function startServer() {
           isPrivate: payload.isPrivate || false,
           password: payload.password || undefined,
           allowGuestQueue: payload.allowGuestQueue !== false,
+          radioPlaying: false,
+          radioPosition: 0,
+          radioStartTime: 0,
         });
       }
 
@@ -358,6 +580,25 @@ async function startServer() {
       // Send full state to joiner
       socket.emit("room_state", buildSyncPayload(room));
       broadcastUserCount(roomId, room);
+
+      // Reconnect recovery: if room has an active live stream, send it to the joining socket
+      const activeStream = liveStreams.get(roomId);
+      if (activeStream && activeStream.buffer && activeStream.isPlaying) {
+        const currentPos = getCurrentByte(activeStream) / activeStream.byteRate;
+        socket.emit('live_stream_ready', {
+          trackId: activeStream.trackId,
+          duration: activeStream.duration,
+          url: `/api/live/${roomId}`,
+          currentTime: currentPos,
+        });
+        // Delayed sync_play so client has time to download the buffer
+        setTimeout(() => {
+          const posNow = getCurrentByte(activeStream) / activeStream.byteRate;
+          const scheduledTime = Date.now() + 2000;
+          socket.emit('sync_play', { scheduledTime, position: posNow });
+          console.log(`[Sync] Late joiner ${socket.id} → sync_play at pos ${posNow.toFixed(1)}s`);
+        }, 1500);
+      }
     });
 
     // === Play ===
@@ -448,22 +689,29 @@ async function startServer() {
       socket.emit("sync", buildSyncPayload(room));
     });
     
-    // === Chat ===
+    // === Chat (rate limited: 5 messages per 5s per socket) ===
     socket.on("chat_message", (data: { text: string }) => {
       const room = getRoom();
       const user = room?.users.get(socket.id);
       if (!room || !user) return;
 
+      // Rate limit chat messages
+      if (!checkRateLimit(`chat:${socket.id}`, 5, 5000)) return;
+
+      // Sanitize and validate
+      const text = (data.text || '').trim().slice(0, 500);
+      if (!text) return;
+
       const message: ChatMessage = {
         id: nanoid(),
-        text: data.text,
+        text,
         userId: user.userId,
         userName: user.name,
         timestamp: Date.now(),
       };
 
       room.messages.push(message);
-      if (room.messages.length > 50) {
+      if (room.messages.length > 100) {
         room.messages.shift();
       }
 
@@ -539,54 +787,209 @@ async function startServer() {
       socket.emit("sync_response", { position: pos });
     });
 
-    // === Reactions ===
+    // === Reactions (rate limited: 3 per 2s per socket) ===
     socket.on("reaction", (data: { emoji: string }) => {
       if (!currentRoomId) return;
+      if (!checkRateLimit(`reaction:${socket.id}`, 3, 2000)) return;
+
+      const validEmojis = ['fire', 'heart', 'clap', 'music', 'spark'];
+      if (!validEmojis.includes(data.emoji)) return;
+
       io.to(currentRoomId).emit("reaction", {
-        id: Math.random().toString(36).substring(2, 9),
+        id: nanoid(8),
         emoji: data.emoji,
         x: Math.random() * 80 + 10,
       });
     });
 
-    // === Live stream controls ===
+    // === Synchronized Play/Pause/Seek ===
+    // The key: server tells ALL clients to start playing at a specific future moment
+    // This gives everyone time to prepare and start simultaneously
+    
     socket.on("live_play", (data?: { position?: number }) => {
       const room = getRoom();
       if (!room || socket.id !== room.hostSocketId) return;
       const stream = liveStreams.get(currentRoomId!);
-      if (!stream || !stream.buffer) return;
-      const pos = data?.position ?? 0;
-      stream.isPlaying = true;
-      stream.playStartByte = Math.floor(pos * stream.byteRate);
-      stream.playStartedAt = Date.now();
-      io.to(currentRoomId!).emit('live_playing', { position: pos });
+      if (stream) {
+        stream.isPlaying = true;
+        stream.playStartedAt = Date.now();
+        stream.playStartByte = Math.floor((data?.position ?? 0) * stream.byteRate);
+      }
+      room.isPlaying = true;
+      
+      // Schedule play with RTT-aware timing
+      // Get max RTT of all clients in room for synchronized start
+      const roomSockets = Array.from(room.users.keys());
+      const rtts = roomSockets.map(sid => socketRTT.get(sid) || 100);
+      const maxRTT = Math.max(...rtts, 100);
+      
+      // Base delay + max RTT to ensure all clients are ready
+      const baseDelay = 2000;
+      const scheduledTime = Date.now() + baseDelay + maxRTT;
+      const position = data?.position ?? 0;
+      
+      io.to(currentRoomId!).emit('sync_play', { scheduledTime, position });
+      console.log(`[Sync] Play scheduled at +${baseDelay + maxRTT}ms (maxRTT: ${maxRTT}ms), position: ${position.toFixed(2)}s`);
     });
 
     socket.on("live_pause", () => {
       const room = getRoom();
       if (!room || socket.id !== room.hostSocketId) return;
       const stream = liveStreams.get(currentRoomId!);
-      if (!stream) return;
-      const currentPos = getCurrentByte(stream) / stream.byteRate;
-      stream.isPlaying = false;
-      stream.playStartByte = getCurrentByte(stream);
-      io.to(currentRoomId!).emit('live_paused', { position: currentPos });
+      let position = 0;
+      if (stream) {
+        position = getCurrentByte(stream) / stream.byteRate;
+        stream.isPlaying = false;
+        stream.playStartByte = getCurrentByte(stream);
+      }
+      room.isPlaying = false;
+      
+      io.to(currentRoomId!).emit('sync_pause', { position });
     });
 
     socket.on("live_seek", (data: { position: number }) => {
       const room = getRoom();
       if (!room || socket.id !== room.hostSocketId) return;
       const stream = liveStreams.get(currentRoomId!);
-      if (!stream || !stream.buffer) return;
-      stream.playStartByte = Math.floor(data.position * stream.byteRate);
-      stream.playStartedAt = Date.now();
-      startStreamingToClients(stream);
-      io.to(currentRoomId!).emit('live_seeked', { position: data.position });
+      if (stream) {
+        stream.playStartByte = Math.floor(data.position * stream.byteRate);
+        stream.playStartedAt = Date.now();
+      }
+      
+      // RTT-aware seek
+      const roomSockets = Array.from(room.users.keys());
+      const rtts = roomSockets.map(sid => socketRTT.get(sid) || 100);
+      const maxRTT = Math.max(...rtts, 100);
+      const scheduledTime = Date.now() + 1500 + maxRTT;
+      io.to(currentRoomId!).emit('sync_seek', { scheduledTime, position: data.position });
     });
 
     socket.on("live_time", (data: { currentTime: number; duration: number }) => {
       if (!currentRoomId) return;
       socket.to(currentRoomId).emit('live_time', data);
+    });
+
+    // === Simple Sync Mode (host broadcasts, listeners follow) ===
+    socket.on("host_time", (data: { position: number; duration: number; isPlaying: boolean }) => {
+      if (!currentRoomId) return;
+      const room = getRoom();
+      if (!room || socket.id !== room.hostSocketId) return;
+      
+      // Update room state
+      room.isPlaying = data.isPlaying;
+      room.positionAtStart = data.position;
+      room.playbackStartedAt = Date.now();
+      
+      // Broadcast to all listeners
+      socket.to(currentRoomId).emit('host_time', data);
+    });
+
+    socket.on("simple_play", (data: { position: number }) => {
+      if (!currentRoomId) return;
+      const room = getRoom();
+      if (!room || socket.id !== room.hostSocketId) return;
+      
+      room.isPlaying = true;
+      room.positionAtStart = data.position;
+      room.playbackStartedAt = Date.now();
+      
+      socket.to(currentRoomId).emit('simple_play', data);
+      console.log(`[SimpleSync] Play at ${data.position.toFixed(2)}s`);
+    });
+
+    socket.on("simple_pause", (data: { position: number }) => {
+      if (!currentRoomId) return;
+      const room = getRoom();
+      if (!room || socket.id !== room.hostSocketId) return;
+      
+      room.isPlaying = false;
+      room.positionAtStart = data.position;
+      
+      socket.to(currentRoomId).emit('simple_pause', data);
+      console.log(`[SimpleSync] Pause at ${data.position.toFixed(2)}s`);
+    });
+
+    socket.on("simple_seek", (data: { position: number }) => {
+      if (!currentRoomId) return;
+      const room = getRoom();
+      if (!room || socket.id !== room.hostSocketId) return;
+      
+      room.positionAtStart = data.position;
+      
+      socket.to(currentRoomId).emit('simple_seek', data);
+    });
+
+    // === WebRTC Signaling ===
+    socket.on("webrtc_host_ready", (data: { peerId: string }) => {
+      const room = getRoom();
+      if (!room) return;
+      room.webrtcHostPeerId = data.peerId;
+      socket.to(currentRoomId!).emit('webrtc_host_ready', { peerId: data.peerId });
+      console.log(`[WebRTC] Host ready: ${data.peerId}`);
+    });
+
+    socket.on("webrtc_get_host", () => {
+      const room = getRoom();
+      if (!room || !room.webrtcHostPeerId) return;
+      socket.emit('webrtc_host_ready', { peerId: room.webrtcHostPeerId });
+    });
+
+    socket.on("webrtc_listener_join", (data: { peerId: string }) => {
+      const room = getRoom();
+      if (!room || !room.hostSocketId) return;
+      io.to(room.hostSocketId).emit('webrtc_listener_joined', { peerId: data.peerId });
+      console.log(`[WebRTC] Listener joining: ${data.peerId}`);
+    });
+
+    socket.on("webrtc_time", (data: { currentTime: number; duration: number }) => {
+      if (!currentRoomId) return;
+      socket.to(currentRoomId).emit('webrtc_time', data);
+    });
+
+    socket.on("webrtc_play", (data: { position: number }) => {
+      if (!currentRoomId) return;
+      socket.to(currentRoomId).emit('webrtc_play', data);
+    });
+
+    socket.on("webrtc_pause", () => {
+      if (!currentRoomId) return;
+      socket.to(currentRoomId).emit('webrtc_pause');
+    });
+
+    socket.on("webrtc_seek", (data: { position: number }) => {
+      if (!currentRoomId) return;
+      socket.to(currentRoomId).emit('webrtc_seek', data);
+    });
+
+    // === Radio Mode ===
+    socket.on("radio_play", (data: { position?: number }) => {
+      const room = getRoom();
+      if (!room || socket.id !== room.hostSocketId) return;
+      room.radioPlaying = true;
+      room.radioPosition = data.position ?? 0;
+      room.radioStartTime = Date.now();
+      io.to(currentRoomId!).emit('radio_started');
+      console.log(`[Radio] Play from ${room.radioPosition.toFixed(1)}s`);
+    });
+
+    socket.on("radio_pause", () => {
+      const room = getRoom();
+      if (!room || socket.id !== room.hostSocketId) return;
+      if (room.radioPlaying) {
+        const elapsed = (Date.now() - room.radioStartTime) / 1000;
+        room.radioPosition += elapsed;
+      }
+      room.radioPlaying = false;
+      io.to(currentRoomId!).emit('radio_stopped');
+      console.log(`[Radio] Paused at ${room.radioPosition.toFixed(1)}s`);
+    });
+
+    socket.on("radio_seek", (data: { position: number }) => {
+      const room = getRoom();
+      if (!room || socket.id !== room.hostSocketId) return;
+      room.radioPosition = data.position;
+      room.radioStartTime = Date.now();
+      io.to(currentRoomId!).emit('radio_seeked', { position: data.position });
     });
 
     // === Disconnect ===
@@ -612,7 +1015,7 @@ async function startServer() {
             const ls = liveStreams.get(rid);
             if (ls) {
               for (const [, client] of ls.clients) {
-                clearInterval(client.intervalId);
+                clearInterval(client.interval);
                 try { client.res.end(); } catch {}
               }
               liveStreams.delete(rid);
@@ -669,30 +1072,49 @@ async function startServer() {
     res.json({ status: "ok", rooms: rooms.size, uptime: process.uptime() });
   });
 
-  // Search YouTube
+  // Search YouTube (rate limited: 10 requests per 30s per IP)
   app.get("/api/search", async (req, res) => {
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    if (!checkRateLimit(`search:${clientIp}`, 10, 30000)) {
+      return res.status(429).json({ error: "Too many requests. Try again in a moment." });
+    }
+
     const q = (req.query.q as string) || "";
     if (!q.trim()) return res.json({ results: [] });
+    if (q.length > 200) return res.status(400).json({ error: "Query too long" });
+
     try {
       const results = await searchYouTube(q, 15);
       res.json({ results });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      console.error("Search API error:", e.message);
+      res.status(500).json({ error: "Search failed. Please try again." });
     }
   });
 
   // Resolve audio stream URL for a YouTube video
   app.get("/api/resolve/:videoId", async (req, res) => {
+    const videoId = req.params.videoId.replace(/[^a-zA-Z0-9_\-]/g, '').slice(0, 20);
+    if (!videoId) return res.status(400).json({ error: "Invalid video ID" });
+
     try {
-      const url = await resolveYouTubeUrl(req.params.videoId);
+      const url = await resolveYouTubeUrl(videoId);
       res.json({ url });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Failed to resolve track" });
     }
   });
 
-  // Proxy audio stream via native https (fetch was failing on this server)
+  // Proxy audio stream via native https (rate limited: 5 per 10s per IP)
   app.get("/api/stream/:videoId", async (req, res) => {
+    const videoId = req.params.videoId.replace(/[^a-zA-Z0-9_\-]/g, '').slice(0, 20);
+    if (!videoId) return res.status(400).json({ error: "Invalid video ID" });
+
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    if (!checkRateLimit(`stream:${clientIp}`, 5, 10000)) {
+      return res.status(429).json({ error: "Too many requests" });
+    }
+
     const proxyStream = (audioUrl: string, isRetry = false) => {
       const headers: Record<string, string> = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -717,8 +1139,8 @@ async function startServer() {
         if (proxyRes.statusCode && proxyRes.statusCode >= 400 && !isRetry) {
           proxyRes.resume();
           // Retry with fresh URL
-          urlCache.delete(req.params.videoId);
-          resolveYouTubeUrl(req.params.videoId).then(freshUrl => {
+          urlCache.delete(videoId);
+          resolveYouTubeUrl(videoId).then(freshUrl => {
             proxyStream(freshUrl, true);
           }).catch(e => {
             if (!res.headersSent) res.status(502).json({ error: e.message });
@@ -739,8 +1161,8 @@ async function startServer() {
         console.error("Stream proxy error:", e.message);
         if (!isRetry && !res.headersSent) {
           // Auto-retry with fresh URL on connection errors
-          urlCache.delete(req.params.videoId);
-          resolveYouTubeUrl(req.params.videoId).then(freshUrl => {
+          urlCache.delete(videoId);
+          resolveYouTubeUrl(videoId).then(freshUrl => {
             proxyStream(freshUrl, true);
           }).catch(err => {
             if (!res.headersSent) res.status(502).json({ error: err.message });
@@ -786,44 +1208,31 @@ async function startServer() {
       res.status(404).json({ error: 'No active stream' });
       return;
     }
-    const clientId = Math.random().toString(36).substring(2, 10);
-    const currentByte = getCurrentByte(stream);
     const totalBytes = stream.buffer.length;
 
-    // Serve the COMPLETE MP3 file as a normal audio response
-    // Browser will seek via Range requests if needed
+    // Serve full MP3 file — sync handled via socket events
     const rangeHeader = req.headers.range;
-    
     if (rangeHeader) {
-      // Handle Range request (browser seeking)
       const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
       if (match) {
         const start = parseInt(match[1]);
         const end = match[2] ? parseInt(match[2]) : totalBytes - 1;
-        const chunkSize = end - start + 1;
-        
         res.writeHead(206, {
           'Content-Type': 'audio/mpeg',
           'Content-Range': `bytes ${start}-${end}/${totalBytes}`,
-          'Content-Length': chunkSize,
+          'Content-Length': end - start + 1,
           'Accept-Ranges': 'bytes',
-          'Cache-Control': 'no-cache',
         });
         res.end(stream.buffer.slice(start, end + 1));
         return;
       }
     }
-
-    // Full file response — browser can seek freely
     res.writeHead(200, {
       'Content-Type': 'audio/mpeg',
       'Content-Length': totalBytes,
       'Accept-Ranges': 'bytes',
-      'Cache-Control': 'no-cache',
     });
     res.end(stream.buffer);
-    
-    console.log(`[Live] Client ${clientId} served full MP3 (${(totalBytes/1024/1024).toFixed(1)}MB) for room ${req.params.roomId}`);
   });
 
   // ===================== SERVE FRONTEND =====================
@@ -842,6 +1251,14 @@ async function startServer() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
+
+  // Global error handler (catches URIError, multer errors, etc.)
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    console.error('[Express] Error:', err.message);
+    if (!res.headersSent) {
+      res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
+    }
+  });
 
   httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`🔊 Soound server running on http://0.0.0.0:${PORT}`);

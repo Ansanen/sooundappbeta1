@@ -53,7 +53,7 @@ export default function App() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const room = params.get('room')?.toUpperCase();
+    const room = params.get('room');
     if (room) {
       setPendingRoomId(room);
       if (userName) {
@@ -119,7 +119,7 @@ export default function App() {
     <div className="min-h-screen bg-[#050505] text-white selection:bg-white/30 overflow-hidden font-sans">
       <AnimatePresence mode="wait">
         {roomId ? (
-          <Room key="room" roomId={roomId} userName={userName} onLeave={leaveRoom} roomType={roomType} roomPassword={roomPassword} initialAllowGuestQueue={allowGuestQueue} />
+          <Room key="room" roomId={roomId} userName={userName} onLeave={leaveRoom} />
         ) : (
           <motion.div
             key="landing"
@@ -133,9 +133,9 @@ export default function App() {
 
             {/* Floating gradient orbs */}
             <div className="fixed inset-0 pointer-events-none overflow-hidden z-0">
-              <div className="absolute top-[20%] left-[15%] w-[400px] h-[400px] rounded-full bg-white/[0.04] blur-[120px]" style={{ animation: 'float-orb-1 20s ease-in-out infinite' }} />
-              <div className="absolute top-[50%] right-[10%] w-[350px] h-[350px] rounded-full bg-white/[0.03] blur-[100px]" style={{ animation: 'float-orb-2 25s ease-in-out infinite' }} />
-              <div className="absolute bottom-[10%] left-[40%] w-[300px] h-[300px] rounded-full bg-white/[0.035] blur-[110px]" style={{ animation: 'float-orb-3 18s ease-in-out infinite' }} />
+              <div className="absolute top-[20%] left-[15%] w-[400px] h-[400px] rounded-full bg-purple-600/15 blur-[120px]" style={{ animation: 'float-orb-1 20s ease-in-out infinite' }} />
+              <div className="absolute top-[50%] right-[10%] w-[350px] h-[350px] rounded-full bg-blue-500/10 blur-[100px]" style={{ animation: 'float-orb-2 25s ease-in-out infinite' }} />
+              <div className="absolute bottom-[10%] left-[40%] w-[300px] h-[300px] rounded-full bg-emerald-500/8 blur-[110px]" style={{ animation: 'float-orb-3 18s ease-in-out infinite' }} />
             </div>
 
             {/* Hero section */}

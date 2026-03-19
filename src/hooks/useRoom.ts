@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { getSocket } from '../lib/socket';
-import { Track, RoomUser } from '../lib/types';
+import { Track, RoomUser, ChatMessage } from '../lib/types';
 
 interface Reaction {
   id: string;
@@ -26,6 +26,7 @@ const useRoom = (roomId: string, userId: string, userName: string, options?: Roo
   const [duration, setDuration] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
   const [reactions, setReactions] = useState<Reaction[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [allowGuestQueue, setAllowGuestQueue] = useState(true);
 
   // Live stream state
@@ -61,6 +62,7 @@ const useRoom = (roomId: string, userId: string, userName: string, options?: Roo
     removeFromQueue: (index: number) => socket.emit('remove_from_queue', { index }),
     playNext: () => socket.emit('play_next'),
     reaction: (emoji: string) => socket.emit('reaction', { emoji }),
+    sendMessage: (text: string) => socket.emit('chat_message', { text }),
     requestSync: () => socket.emit('request_sync'),
     hostPosition: (pos: number) => socket.emit('host_position', { position: pos }),
     toggleGuestQueue: () => socket.emit('toggle_guest_queue'),
@@ -79,6 +81,7 @@ const useRoom = (roomId: string, userId: string, userName: string, options?: Roo
       setCurrentTrack(state.currentTrack || null);
       setIsPlaying(state.isPlaying || false);
       setDuration(state.liveStreamDuration || state.currentTrack?.duration || 0);
+      if (state.messages) setMessages(state.messages);
       if (state.allowGuestQueue !== undefined) setAllowGuestQueue(state.allowGuestQueue);
       // Set live URL for late joiners
       if (state.liveStreamUrl) {
@@ -152,12 +155,24 @@ const useRoom = (roomId: string, userId: string, userName: string, options?: Roo
       showToast(data.message);
     });
 
+    socket.on('chat_message', (data: ChatMessage) => {
+      setMessages(prev => {
+        const next = [...prev, data];
+        return next.length > 100 ? next.slice(-100) : next;
+      });
+    });
+
     socket.on('reaction', (data: Reaction) => {
-      setReactions(prev => [...prev, data]);
+      setReactions(prev => {
+        // Limit to 20 simultaneous reactions for performance
+        const next = [...prev, data];
+        return next.length > 20 ? next.slice(-20) : next;
+      });
       setTimeout(() => setReactions(prev => prev.filter(r => r.id !== data.id)), 3000);
     });
 
     socket.on('live_status', (data: any) => {
+      console.log('[useRoom] live_status:', data.status);
       if (data.status === 'loading') {
         setLiveStatus('loading');
         setLiveError(null);
@@ -171,8 +186,9 @@ const useRoom = (roomId: string, userId: string, userName: string, options?: Roo
     });
 
     socket.on('live_stream_ready', (data: any) => {
+      console.log('[useRoom] live_stream_ready:', data);
       setLiveUrl(data.url + '?t=' + Date.now());
-      setLiveStatus('playing');
+      setLiveStatus('ready'); // Changed from 'playing' - let audio hook trigger ready status
       setDuration(data.duration || 0);
       if (data.currentTime) setLiveCurrentTime(data.currentTime);
     });
@@ -216,6 +232,7 @@ const useRoom = (roomId: string, userId: string, userName: string, options?: Roo
       socket.off('room_settings');
       socket.off('join_error');
       socket.off('queue_error');
+      socket.off('chat_message');
       socket.off('reaction');
       socket.off('live_status');
       socket.off('live_stream_ready');
@@ -241,6 +258,7 @@ const useRoom = (roomId: string, userId: string, userName: string, options?: Roo
     duration,
     toast,
     reactions,
+    messages,
     allowGuestQueue,
     emit,
     showToast,

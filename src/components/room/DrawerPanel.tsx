@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { X, Crown, Loader2, Trash2, GripVertical } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { X, Crown, Loader2, Trash2, GripVertical, Send, MessageCircle } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { IconSearch, IconQueue, IconUsers, IconPlay, IconPlus } from '../CustomIcons';
-import { RoomUser, Track } from '../../lib/types';
+import { RoomUser, Track, ChatMessage } from '../../lib/types';
 import { getSocket } from '../../lib/socket';
 
-type DrawerTab = 'search' | 'queue' | 'users';
+type DrawerTab = 'search' | 'queue' | 'users' | 'chat';
 
 interface DrawerPanelProps {
   isOpen: boolean;
@@ -16,9 +16,12 @@ interface DrawerPanelProps {
   queue: Track[];
   users: RoomUser[];
   userCount: number;
+  messages: ChatMessage[];
+  currentUserId: string;
   onSelectTrack: (track: any) => void;
   onAddToQueue: (track: any) => void;
   onRemoveFromQueue: (index: number) => void;
+  onSendMessage: (text: string) => void;
   allowGuestQueue?: boolean;
   onToggleGuestQueue?: () => void;
 }
@@ -59,13 +62,44 @@ export const DrawerPanel: React.FC<DrawerPanelProps> = ({
   queue,
   users,
   userCount,
+  messages,
+  currentUserId,
   onSelectTrack,
   onAddToQueue,
   onRemoveFromQueue,
+  onSendMessage,
   allowGuestQueue = true,
   onToggleGuestQueue,
 }) => {
   const [activeTab, setActiveTab] = useState<DrawerTab>(initialTab);
+  const [chatText, setChatText] = useState('');
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const prevMsgCount = useRef(messages.length);
+
+  // Track unread messages when not on chat tab
+  useEffect(() => {
+    if (activeTab === 'chat' && isOpen) {
+      setUnreadCount(0);
+      prevMsgCount.current = messages.length;
+    } else if (messages.length > prevMsgCount.current) {
+      setUnreadCount(prev => prev + (messages.length - prevMsgCount.current));
+      prevMsgCount.current = messages.length;
+    }
+  }, [messages.length, activeTab, isOpen]);
+
+  // Auto-scroll chat
+  useEffect(() => {
+    if (activeTab === 'chat') {
+      chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages, activeTab]);
+
+  const handleSendChat = () => {
+    if (!chatText.trim()) return;
+    onSendMessage(chatText.trim());
+    setChatText('');
+  };
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -101,7 +135,7 @@ export const DrawerPanel: React.FC<DrawerPanelProps> = ({
   }, [onClose]);
 
   // Tab refs for animated underline
-  const tabRefs = useRef<Record<DrawerTab, HTMLButtonElement | null>>({ search: null, queue: null, users: null });
+  const tabRefs = useRef<Record<DrawerTab, HTMLButtonElement | null>>({ search: null, queue: null, users: null, chat: null });
   const [underlineStyle, setUnderlineStyle] = useState({ left: 0, width: 0 });
 
   useEffect(() => {
@@ -129,18 +163,24 @@ export const DrawerPanel: React.FC<DrawerPanelProps> = ({
 
     searchTimeout.current = window.setTimeout(async () => {
       setIsSearching(true);
-      addRecentSearch(searchQuery.trim());
-      setRecentSearches(getRecentSearches());
       try {
         const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        setSearchResults(data.results || []);
+        const results = data.results || [];
+        setSearchResults(results);
+        // Only save to recent if we got results
+        if (results.length > 0) {
+          addRecentSearch(searchQuery.trim());
+          setRecentSearches(getRecentSearches());
+        }
       } catch (error) {
         console.error("Search failed:", error);
+        setSearchResults([]);
       } finally {
         setIsSearching(false);
       }
-    }, 600);
+    }, 500);
 
     return () => { if (searchTimeout.current) clearTimeout(searchTimeout.current) };
   }, [searchQuery]);
@@ -188,16 +228,45 @@ export const DrawerPanel: React.FC<DrawerPanelProps> = ({
         return (
           <>
             <div className="p-4 md:p-6">
-              <div className="relative">
-                <IconSearch className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/40" />
-                <input
-                  type="text"
-                  placeholder="Search YouTube..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full bg-white/5 border border-white/10 rounded-2xl pl-12 pr-4 py-3.5 md:py-4 text-base focus:outline-none focus:border-white/30 transition-colors placeholder:text-white/30 text-white font-display"
-                />
-                {isSearching && <Loader2 className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40 animate-spin" />}
+              <div className="flex gap-2">
+                <div className="relative flex-1">
+                  <IconSearch className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/40" />
+                  <input
+                    type="text"
+                    placeholder="Search YouTube..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="w-full bg-white/5 border border-white/10 rounded-2xl pl-12 pr-4 py-3.5 md:py-4 text-base focus:outline-none focus:border-white/30 transition-colors placeholder:text-white/30 text-white font-display"
+                  />
+                  {isSearching && <Loader2 className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40 animate-spin" />}
+                </div>
+                {/* Upload button */}
+                <label className="flex items-center justify-center w-14 h-14 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl cursor-pointer transition-colors">
+                  <input
+                    type="file"
+                    accept="audio/*"
+                    className="hidden"
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      const formData = new FormData();
+                      formData.append('audio', file);
+                      try {
+                        const res = await fetch('/api/upload', { method: 'POST', body: formData });
+                        if (res.ok) {
+                          const data = await res.json();
+                          onAddToQueue({ id: data.id, title: data.title, artist: 'Uploaded', url: data.url, source: 'upload' });
+                        }
+                      } catch (err) {
+                        console.error('Upload failed:', err);
+                      }
+                      e.target.value = '';
+                    }}
+                  />
+                  <svg className="w-5 h-5 text-white/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                  </svg>
+                </label>
               </div>
               {/* Recent searches */}
               {!searchQuery && recentSearches.length > 0 && (
@@ -255,6 +324,73 @@ export const DrawerPanel: React.FC<DrawerPanelProps> = ({
               ) : null}
             </div>
           </>
+        );
+      case 'chat':
+        return (
+          <div className="flex-1 flex flex-col min-h-0">
+            <div className="flex-1 overflow-y-auto px-4 py-4 custom-scrollbar">
+              <div className="space-y-3">
+                {messages.map((msg) => (
+                  <div
+                    key={msg.id}
+                    className={cn("flex flex-col", msg.userId === currentUserId ? "items-end" : "items-start")}
+                  >
+                    {msg.isSystem ? (
+                      <div className="w-full text-center my-1.5">
+                        <p className="text-xs text-white/25 font-display">{msg.text}</p>
+                      </div>
+                    ) : (
+                      <div className={cn("max-w-[85%]", msg.userId === currentUserId ? "items-end" : "items-start")}>
+                        <div className="flex items-center gap-2 mb-0.5">
+                          {msg.userId !== currentUserId && (
+                            <span className="text-xs font-display font-bold text-white/50">{msg.userName}</span>
+                          )}
+                          <span className="text-[10px] text-white/20">
+                            {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                        </div>
+                        <div className={cn(
+                          "px-3.5 py-2 rounded-2xl text-sm font-display",
+                          msg.userId === currentUserId
+                            ? "bg-white/15 rounded-br-sm"
+                            : "bg-white/5 rounded-bl-sm border border-white/5"
+                        )}>
+                          {msg.text}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+                {messages.length === 0 && (
+                  <div className="h-full flex flex-col items-center justify-center text-white/25 space-y-3 pt-16">
+                    <MessageCircle className="w-12 h-12 opacity-30" />
+                    <p className="font-display">No messages yet</p>
+                    <p className="font-display text-xs text-white/15">Start the conversation</p>
+                  </div>
+                )}
+              </div>
+              <div ref={chatEndRef} />
+            </div>
+            <div className="p-3 border-t border-white/5">
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={chatText}
+                  onChange={(e) => setChatText(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleSendChat(); }}
+                  placeholder="Type a message..."
+                  className="flex-1 bg-white/5 border border-white/10 rounded-2xl px-4 py-2.5 text-sm font-display focus:outline-none focus:border-white/20 transition-colors placeholder:text-white/25"
+                />
+                <button
+                  onClick={handleSendChat}
+                  disabled={!chatText.trim()}
+                  className="w-10 h-10 rounded-full bg-white text-black flex items-center justify-center hover:bg-gray-200 transition-colors disabled:opacity-30 disabled:cursor-not-allowed btn-press shrink-0"
+                >
+                  <Send className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          </div>
         );
       case 'queue':
         return (
@@ -370,6 +506,16 @@ export const DrawerPanel: React.FC<DrawerPanelProps> = ({
                   Queue
                   {queue.length > 0 && (
                     <span className="w-5 h-5 bg-white/20 text-white text-xs rounded-full flex items-center justify-center">{queue.length}</span>
+                  )}
+                </button>
+                <button
+                  ref={el => { tabRefs.current.chat = el; }}
+                  onClick={() => { setActiveTab('chat'); setUnreadCount(0); }}
+                  className={cn("font-display font-bold text-xl transition-colors flex items-center gap-2 pb-2", activeTab === 'chat' ? "text-white" : "text-white/40 hover:text-white/80")}
+                >
+                  Chat
+                  {unreadCount > 0 && activeTab !== 'chat' && (
+                    <span className="w-5 h-5 bg-white text-black text-xs rounded-full flex items-center justify-center font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>
                   )}
                 </button>
                 <button

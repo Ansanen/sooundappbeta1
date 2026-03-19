@@ -1,17 +1,18 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { motion } from 'framer-motion';
+import { motion } from 'motion/react';
 import { SooundLogo } from '../SooundLogo';
 import { IconChevronLeft, IconShare, IconUsers, IconSearch, IconQueue } from '../CustomIcons';
-import { Crown } from 'lucide-react';
+import { Crown, MessageCircle } from 'lucide-react';
 import { cn } from '../../lib/utils';
 
 interface RoomHeaderProps {
   roomId: string;
   userCount: number;
   queueCount: number;
+  messageCount?: number;
   isHost: boolean;
   onLeave: () => void;
-  onOpenDrawer: (tab: 'search' | 'queue' | 'users') => void;
+  onOpenDrawer: (tab: 'search' | 'queue' | 'users' | 'chat') => void;
   onOpenShare: () => void;
   onOpenShareCard?: () => void;
 }
@@ -105,6 +106,12 @@ export const RoomHeader: React.FC<RoomHeaderProps> = ({
         >
           {isHost ? <Crown className="w-3.5 h-3.5 text-white/70" /> : <IconUsers className="w-3.5 h-3.5" />}
           <span className={cn("font-display font-bold text-sm", countBounce && "count-bounce")}>{userCount}</span>
+        </button>
+        <button
+          onClick={() => onOpenDrawer('chat')}
+          className="w-10 h-10 rounded-full bg-white/10 border border-white/5 flex items-center justify-center hover:bg-white/20 transition-all btn-press"
+        >
+          <MessageCircle className="w-4 h-4 md:w-5 md:h-5" />
         </button>
         <button
           onClick={() => onOpenDrawer('search')}

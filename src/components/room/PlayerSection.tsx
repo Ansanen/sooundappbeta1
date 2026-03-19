@@ -1,5 +1,5 @@
 import React, { useState, useRef, useCallback } from 'react';
-import { motion } from 'framer-motion';
+import { motion } from 'motion/react';
 import { Track } from '../../lib/types';
 import { IconPlay, IconPause, IconNext, IconPrev, IconVolume, IconSearch } from '../CustomIcons';
 import { CircularVisualizer } from '../CircularVisualizer';
@@ -188,30 +188,32 @@ export const PlayerSection: React.FC<PlayerSectionProps> = ({
                         </div>
 
                         {/* Controls */}
-                        <div className="flex items-center justify-center gap-6 md:gap-8">
+                        <div className="flex items-center justify-center gap-4">
                             <button
                                 onClick={() => isHost ? onPlayPrev() : onShowToast("Only host can control playback")}
-                                className="btn-press p-3 text-white/40 hover:text-white transition-colors rounded-full hover:bg-white/5 min-w-[44px] min-h-[44px] flex items-center justify-center"
+                                className="control-btn w-12 h-12 rounded-full flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 active:scale-90 active:bg-white/20 transition-all"
                             >
-                                <IconPrev className="w-7 h-7" />
+                                <IconPrev className="w-6 h-6" />
                             </button>
                             <button
                                 onClick={onPlayPause}
                                 className={cn(
-                                    "btn-press w-16 h-16 rounded-full flex items-center justify-center transition-all glass-play-btn",
-                                    isPlaying ? "shadow-[0_0_30px_rgba(255,255,255,0.25)]" : "shadow-[0_0_20px_rgba(255,255,255,0.1)]"
+                                    "w-16 h-16 rounded-full flex items-center justify-center transition-all active:scale-90",
+                                    isPlaying 
+                                      ? "bg-white text-black shadow-[0_0_40px_rgba(255,255,255,0.3)]" 
+                                      : "bg-white/90 text-black shadow-[0_0_20px_rgba(255,255,255,0.15)]"
                                 )}
                             >
-                                {isPlaying ? <IconPause className="w-7 h-7" /> : <IconPlay className="w-7 h-7 ml-1" />}
+                                {isPlaying ? <IconPause className="w-6 h-6" /> : <IconPlay className="w-6 h-6 ml-0.5" />}
                             </button>
                             <button
                                 onClick={() => isHost ? onPlayNext() : onShowToast("Only host can control playback")}
                                 className={cn(
-                                    "btn-press p-3 transition-colors rounded-full hover:bg-white/5 min-w-[44px] min-h-[44px] flex items-center justify-center",
-                                    queueCount > 0 ? "text-white hover:text-white/80" : "text-white/40 hover:text-white"
+                                    "control-btn w-12 h-12 rounded-full flex items-center justify-center hover:bg-white/10 active:scale-90 active:bg-white/20 transition-all",
+                                    queueCount > 0 ? "text-white" : "text-white/50 hover:text-white"
                                 )}
                             >
-                                <IconNext className="w-7 h-7" />
+                                <IconNext className="w-6 h-6" />
                             </button>
                         </div>
                     </div>
@@ -246,14 +248,14 @@ export const PlayerSection: React.FC<PlayerSectionProps> = ({
                             </div>
                         </div>
 
-                        {/* Reactions — glass pill with colored icons */}
-                        <div className="glass-reactions flex items-center gap-0.5 rounded-full px-1.5 py-0.5">
-                            {REACTIONS.map((r) => (
+                        {/* Reactions */}
+                        <div className="flex items-center gap-1 bg-white/5 rounded-full px-2 py-1">
+                            {REACTIONS.slice(0, 4).map((r) => (
                                 <button
                                     key={r.id}
                                     onClick={() => onSendReaction(r.id)}
-                                    className="btn-press reaction-btn p-2 rounded-full transition-all min-w-[44px] min-h-[44px] flex items-center justify-center"
-                                    style={{ color: r.color, '--glow': r.color } as React.CSSProperties}
+                                    className="w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 active:scale-90 transition-all"
+                                    style={{ color: r.color }}
                                     title={r.label}
                                 >
                                     {r.icon}

@@ -1,6 +1,6 @@
 import React from 'react';
 import { Track } from '../../lib/types';
-import { motion } from 'framer-motion';
+import { motion } from 'motion/react';
 
 interface NowPlayingProps {
   currentTrack: Track;
