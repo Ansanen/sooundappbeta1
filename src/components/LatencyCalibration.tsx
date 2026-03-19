@@ -9,19 +9,16 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { Volume2, Play, RotateCcw, Check } from 'lucide-react';
 
 interface LatencyCalibrationProps {
-  isOpen: boolean;
   currentOffset: number;  // Current offset in ms
-  onSave: (offset: number) => void;
+  onOffsetChange: (offset: number) => void;
   onClose: () => void;
 }
 
 export function LatencyCalibration({
-  isOpen,
   currentOffset,
-  onSave,
+  onOffsetChange,
   onClose
 }: LatencyCalibrationProps) {
-  if (!isOpen) return null;
   const [offset, setOffset] = useState(currentOffset);
   const [isPlaying, setIsPlaying] = useState(false);
   const [tapTimes, setTapTimes] = useState<number[]>([]);
@@ -218,7 +215,7 @@ export function LatencyCalibration({
           </button>
           <button
             onClick={() => {
-              onSave(offset);
+              onOffsetChange(offset);
               onClose();
             }}
             className="flex-1 flex items-center justify-center gap-2 bg-green-600 hover:bg-green-500 text-white py-3 rounded-xl transition-colors"

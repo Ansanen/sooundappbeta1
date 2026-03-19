@@ -39,7 +39,7 @@ export class GlobalClock {
     
     // Create worker
     this.worker = new Worker(
-      new URL('../../workers/time-sync.worker.ts', import.meta.url),
+      new URL('../workers/time-sync.worker.ts', import.meta.url),
       { type: 'module' }
     );
     

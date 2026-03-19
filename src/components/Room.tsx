@@ -1,15 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import useRoom from '../hooks/useRoom';
-import { useSyncedAudio, SyncedAudioStatus } from '../hooks/useSyncedAudio';
+import { useUnifiedAudio, AudioMode, AudioStatus } from '../hooks/useUnifiedAudio';
 import { Onboarding } from './Onboarding';
 import { RoomHeader } from './room/RoomHeader';
 import { PlayerSection } from './room/PlayerSection';
 import { DrawerPanel } from './room/DrawerPanel';
 import { ShareModal } from './room/ShareModal';
 import { ShareCard } from './room/ShareCard';
-import { SyncIndicator } from './SyncIndicator';
-import { LatencyCalibration } from './LatencyCalibration';
 import { Track } from '../lib/types';
 import { MoodBackground } from './room/MoodBackground';
 
@@ -136,40 +134,24 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
     }
   }, [isHost, emit]);
 
-  // Phase-coherent audio sync
-  const {
-    status: syncStatus,
-    stats: syncStats,
-    volume,
-    duration: audioDuration,
-    currentTime: audioCurrentTime,
-    play,
-    pause,
-    seek,
-    setVolume,
-    setLatencyOffset,
-    initialize: initAudio,
-    emitPlay,
-    emitPause,
-    emitSeek,
-  } = useSyncedAudio({
+  const [audioStatus, setAudioStatus] = useState<string>('idle');
+  const [audioStatusMsg, setAudioStatusMsg] = useState<string | undefined>();
+  
+  // Audio mode: 'sync' (NTP-based) or 'webrtc' (host streams directly)
+  const [audioMode, setAudioMode] = useState<AudioMode>('sync');
+  
+  const { status: syncStatus, volume, setVolume, play, pause, seekTo, unlock, getCurrentPosition } = useUnifiedAudio({
     roomId,
-    isHost,
     trackUrl: liveUrl,
+    isHost,
+    mode: audioMode,
     onTimeUpdate: (pos, dur) => { setCurrentTime(pos); setDuration(dur); },
     onEnded: handleEnded,
-    onError: (err) => console.error('[Room] Audio error:', err),
+    onStatusChange: (s, msg) => { setAudioStatus(s); setAudioStatusMsg(msg); },
   });
 
-  // Calibration modal state
-  const [showCalibration, setShowCalibration] = useState(false);
-  
   // Dummy audioRef for components that need it (PlayerSection etc)
   const audioRef = useRef<HTMLAudioElement>(null);
-  
-  // Map syncStatus to old audioStatus format for compatibility
-  const audioStatus = syncStatus;
-  const audioStatusMsg = syncStatus === 'error' ? 'Audio error' : undefined;
 
   useEffect(() => {
     if (currentTrack) {
@@ -233,7 +215,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
         emit.livePause();
       });
       navigator.mediaSession.setActionHandler('nexttrack', queue.length > 0 ? () => emit.playNext() : null);
-      navigator.mediaSession.setActionHandler('previoustrack', () => seek(0));
+      navigator.mediaSession.setActionHandler('previoustrack', () => seekTo(0));
     }
 
     return () => {
@@ -249,18 +231,16 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
   // Sync is now handled by scheduledTime in useSync (sync_play/sync_pause events)
   // No need for isPlaying-based audio control here
 
-  const handlePlayPause = async () => {
+  const handlePlayPause = () => {
     console.log('[Room] handlePlayPause - isHost:', isHost, 'isPlaying:', isPlaying, 'syncStatus:', syncStatus, 'localAudioBlocked:', localAudioBlocked, 'currentTrack:', !!currentTrack);
     
-    // Initialize audio system on first interaction (mobile requirement)
-    if (syncStatus === 'idle') {
-      await initAudio();
-    }
+    // Unlock AudioContext on user gesture (mobile requirement)
+    unlock();
     
     if (!isHost) {
-      // Listener: start playback (sync handled by socket events)
+      // Listener: unlock audio context + play if we have a buffer
       console.log('[Room] Listener play/pause');
-      if (syncStatus === 'ready' || syncStatus === 'paused' || localAudioBlocked) {
+      if (syncStatus === 'ready' || localAudioBlocked) {
         play();
         setLocalAudioBlocked(false);
       } else if (syncStatus === 'playing') {
@@ -269,14 +249,12 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
       return;
     }
     
-    // Host: emit sync commands to all listeners
-    console.log('[Room] Host play/pause - will call:', isPlaying ? 'emitPause()' : 'emitPlay()');
+    // Host: call play/pause directly (handles both sync and webrtc modes internally)
+    console.log('[Room] Host play/pause - will call:', isPlaying ? 'pause()' : 'play()');
     if (isPlaying) {
-      emitPause();
       pause();
     } else {
-      emitPlay(currentTime);
-      play(currentTime);
+      play();
     }
   };
 
@@ -291,25 +269,23 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
         handlePlayPause();
       } else if (e.code === 'ArrowRight' && isHost) {
         e.preventDefault();
-        const t = Math.min(currentTime + 10, duration || 0);
-        seek(t);
-        emitSeek(t);
+        const t = Math.min(getCurrentPosition() + 10, duration || 0);
+        emit.liveSeek(t);
       } else if (e.code === 'ArrowLeft' && isHost) {
         e.preventDefault();
-        const t = Math.max(currentTime - 10, 0);
-        seek(t);
-        emitSeek(t);
+        const t = Math.max(getCurrentPosition() - 10, 0);
+        emit.liveSeek(t);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isHost, isPlaying, liveUrl, currentTime, duration, seek, emitSeek]);
+  }, [isHost, isPlaying, liveUrl]);
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const time = parseFloat(e.target.value);
     if (isHost) {
-      seek(time);
-      emitSeek(time);
+      seekTo(time);
+      emit.liveSeek(time);
     }
   };
 
@@ -536,30 +512,37 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
           onOpenShareCard={() => setShowShareCard(true)}
         />
 
-        {/* Sync Status Indicator */}
-        {syncStatus === 'playing' && (
-          <div className="absolute top-20 right-4 z-30 flex items-center gap-2">
-            <SyncIndicator stats={syncStats} compact />
+        {/* Audio Mode Switcher — Host Only */}
+        {isHost && (
+          <div className="flex items-center justify-center gap-1 mb-4 bg-white/5 rounded-full p-1">
             <button
-              onClick={() => setShowCalibration(true)}
-              className="p-2 rounded-full bg-black/40 backdrop-blur-sm hover:bg-white/10 transition-colors"
-              title="Latency Calibration"
+              onClick={() => {
+                setAudioMode('sync');
+                showToast('🔄 Switched to Sync mode');
+              }}
+              className={`px-4 py-2 rounded-full text-xs font-medium transition-all active:scale-95 ${
+                audioMode === 'sync' 
+                  ? 'bg-purple-500 text-white shadow-lg shadow-purple-500/30' 
+                  : 'text-white/50 hover:text-white hover:bg-white/10'
+              }`}
             >
-              <svg viewBox="0 0 24 24" className="w-4 h-4 text-white/60">
-                <path d="M12 15a3 3 0 100-6 3 3 0 000 6z" fill="currentColor"/>
-                <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z" stroke="currentColor" strokeWidth="2" fill="none"/>
-              </svg>
+              Sync
+            </button>
+            <button
+              onClick={() => {
+                setAudioMode('webrtc');
+                showToast('📡 Switched to WebRTC mode');
+              }}
+              className={`px-4 py-2 rounded-full text-xs font-medium transition-all active:scale-95 ${
+                audioMode === 'webrtc' 
+                  ? 'bg-emerald-500 text-white shadow-lg shadow-emerald-500/30' 
+                  : 'text-white/50 hover:text-white hover:bg-white/10'
+              }`}
+            >
+              WebRTC
             </button>
           </div>
         )}
-
-        {/* Latency Calibration Modal */}
-        <LatencyCalibration
-          isOpen={showCalibration}
-          onClose={() => setShowCalibration(false)}
-          onSave={setLatencyOffset}
-          currentOffset={parseFloat(localStorage.getItem('soound_latency_offset') || '0')}
-        />
 
         <PlayerSection
           currentTrack={currentTrack}
@@ -574,7 +557,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
           onSeek={handleSeek}
           onVolumeChange={(e) => setVolume(parseFloat(e.target.value))}
           onPlayNext={() => emit.playNext()}
-          onPlayPrev={() => seek(0)}
+          onPlayPrev={() => seekTo(0)}
           onShowToast={showToast}
           onSendReaction={(emoji) => emit.reaction(emoji)}
           onOpenSearch={() => openDrawer('search')}
