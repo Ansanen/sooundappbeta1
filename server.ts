@@ -1434,7 +1434,8 @@ async function startServer() {
     const distPath = path.join(process.cwd(), "dist");
     const landingPath = path.join(process.cwd(), "landing");
 
-    // Serve landing static assets
+    // Serve landing static assets (root /assets for landing page)
+    app.use("/assets", express.static(path.join(landingPath, "assets")));
     app.use("/landing", express.static(landingPath));
 
     // Serve app static assets
