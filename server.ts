@@ -1432,8 +1432,33 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (_req, res) => {
+    const landingPath = path.join(process.cwd(), "landing");
+
+    // Serve landing static assets
+    app.use("/landing", express.static(landingPath));
+
+    // Serve app static assets
+    app.use("/app", express.static(distPath));
+
+    // Landing page at root
+    app.get("/", (_req, res) => {
+      res.sendFile(path.join(landingPath, "index.html"));
+    });
+
+    // App routes — SPA fallback
+    app.get("/app", (_req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+    app.get("/app/*", (_req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+
+    // Legacy: ?room=XXX redirects to app
+    app.get("*", (req, res) => {
+      if (req.query.room) {
+        return res.redirect(`/app?room=${req.query.room}`);
+      }
+      // Default: serve app for any other route (backwards compat)
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
