@@ -12,6 +12,72 @@ import { nanoid } from "nanoid";
 const DENO_PATH = process.env.DENO_PATH || "/root/.deno/bin/deno";
 const YT_DLP = process.env.YT_DLP_PATH || "/usr/local/bin/yt-dlp";
 
+// ===================== SPOTIFY SERVICE =====================
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || "46398cccb6be4f909d95afd1e43ef3e4";
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || "fab561c092dd4027ae98775a513bfb45";
+const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
+const SPOTIFY_API = "https://api.spotify.com/v1";
+
+let spotifyToken: string | null = null;
+let spotifyTokenExpiresAt = 0;
+
+async function getSpotifyToken(): Promise<string> {
+  if (spotifyToken && Date.now() < spotifyTokenExpiresAt - 10000) {
+    return spotifyToken;
+  }
+
+  const res = await fetch(SPOTIFY_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: `Basic ${Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64")}`,
+    },
+    body: "grant_type=client_credentials",
+  });
+
+  if (!res.ok) throw new Error(`Spotify token error: ${res.status}`);
+  const data = await res.json();
+  spotifyToken = data.access_token;
+  spotifyTokenExpiresAt = Date.now() + data.expires_in * 1000;
+  console.log("[Spotify] Token refreshed, expires in", data.expires_in, "s");
+  return spotifyToken!;
+}
+
+interface SpotifyTrack {
+  spotifyId: string;
+  title: string;
+  artist: string;
+  album: string;
+  cover: string | null;
+  duration: number; // ms
+  previewUrl: string | null;
+}
+
+async function searchSpotify(query: string, limit = 10): Promise<SpotifyTrack[]> {
+  const token = await getSpotifyToken();
+  const url = new URL(`${SPOTIFY_API}/search`);
+  url.searchParams.set("q", query);
+  url.searchParams.set("type", "track");
+  url.searchParams.set("limit", String(limit));
+
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!res.ok) throw new Error(`Spotify search error: ${res.status}`);
+  const data = await res.json();
+
+  return data.tracks.items.map((track: any) => ({
+    spotifyId: track.id,
+    title: track.name,
+    artist: track.artists.map((a: any) => a.name).join(", "),
+    album: track.album.name,
+    cover: track.album.images[1]?.url ?? track.album.images[0]?.url ?? null,
+    duration: track.duration_ms,
+    previewUrl: track.preview_url,
+  }));
+}
+
 // Simple in-memory rate limiter
 const rateLimiter = new Map<string, { count: number; resetAt: number }>();
 function checkRateLimit(key: string, maxRequests: number, windowMs: number): boolean {
@@ -1124,22 +1190,37 @@ async function startServer() {
   });
 
   // Search YouTube (rate limited: 10 requests per 30s per IP)
+  // Primary search: Spotify (better metadata + covers)
   app.get("/api/search", async (req, res) => {
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-    if (!checkRateLimit(`search:${clientIp}`, 10, 30000)) {
+    if (!checkRateLimit(`search:${clientIp}`, 15, 30000)) {
       return res.status(429).json({ error: "Too many requests. Try again in a moment." });
     }
 
     const q = (req.query.q as string) || "";
-    if (!q.trim()) return res.json({ results: [] });
+    const source = (req.query.source as string) || "spotify";
+    if (!q.trim()) return res.json({ results: [], tracks: [] });
     if (q.length > 200) return res.status(400).json({ error: "Query too long" });
 
     try {
-      const results = await searchYouTube(q, 15);
-      res.json({ results });
+      if (source === "youtube") {
+        // Legacy YouTube search
+        const results = await searchYouTube(q, 15);
+        res.json({ results });
+      } else {
+        // Spotify search (default)
+        const tracks = await searchSpotify(q, 15);
+        res.json({ tracks });
+      }
     } catch (e: any) {
       console.error("Search API error:", e.message);
-      res.status(500).json({ error: "Search failed. Please try again." });
+      // Fallback to YouTube if Spotify fails
+      try {
+        const results = await searchYouTube(q, 15);
+        res.json({ results, fallback: true });
+      } catch {
+        res.status(500).json({ error: "Search failed. Please try again." });
+      }
     }
   });
 
@@ -1152,6 +1233,60 @@ async function startServer() {
       const url = await resolveYouTubeUrl(videoId);
       res.json({ url });
     } catch (e: any) {
+      res.status(500).json({ error: "Failed to resolve track" });
+    }
+  });
+
+  // Resolve Spotify track → find best YouTube match by duration
+  app.get("/api/resolve-spotify", async (req, res) => {
+    const { artist, title, duration } = req.query as { artist?: string; title?: string; duration?: string };
+    if (!artist || !title) {
+      return res.status(400).json({ error: "artist and title required" });
+    }
+
+    const spotifyDurationMs = parseInt(duration || "0", 10);
+    const query = `${artist} - ${title}`;
+
+    try {
+      // Search YouTube for candidates
+      const candidates = await new Promise<{ videoId: string; title: string; duration: number }[]>((resolve, reject) => {
+        execFile(YT_DLP, [
+          `ytsearch5:${query}`,
+          "--print", "%(id)s\t%(title)s\t%(duration)s",
+          "--no-download",
+          "--no-playlist",
+          "--match-filter", "!is_live",
+        ], { timeout: 30000 }, (err, stdout, stderr) => {
+          if (err) return reject(new Error(stderr || err.message));
+          const results = stdout.trim().split("\n").filter(Boolean).map(line => {
+            const [videoId, title, durStr] = line.split("\t");
+            return { videoId, title, duration: parseFloat(durStr) || 0 };
+          }).filter(c => c.videoId && c.duration > 0);
+          resolve(results);
+        });
+      });
+
+      if (candidates.length === 0) {
+        return res.status(404).json({ error: "No YouTube match found" });
+      }
+
+      // Pick best match by duration
+      const targetSec = spotifyDurationMs / 1000;
+      const best = candidates.reduce((a, b) => 
+        Math.abs(a.duration - targetSec) < Math.abs(b.duration - targetSec) ? a : b
+      );
+
+      const durationDiff = Math.abs(best.duration - targetSec).toFixed(1);
+      console.log(`[Spotify→YT] "${query}" → ${best.videoId} (diff: ${durationDiff}s)`);
+
+      res.json({ 
+        videoId: best.videoId, 
+        youtubeTitle: best.title,
+        duration: best.duration,
+        durationDiff: parseFloat(durationDiff),
+      });
+    } catch (e: any) {
+      console.error("Resolve Spotify error:", e.message);
       res.status(500).json({ error: "Failed to resolve track" });
     }
   });

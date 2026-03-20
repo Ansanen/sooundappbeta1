@@ -391,16 +391,46 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
     }
   };
 
-  const handleSelectTrack = (trackData: any) => {
+  // Resolve Spotify track to YouTube videoId
+  const resolveSpotifyTrack = async (trackData: any): Promise<string | null> => {
+    if (trackData.youtubeId) return trackData.youtubeId;
+    if (!trackData.spotifyId) return trackData.id;
+
+    try {
+      const params = new URLSearchParams({
+        artist: trackData.artist || '',
+        title: trackData.title || '',
+        duration: String(trackData.durationMs || trackData.duration * 1000 || 0),
+      });
+      const res = await fetch(`/api/resolve-spotify?${params}`);
+      if (!res.ok) throw new Error('Resolve failed');
+      const data = await res.json();
+      return data.videoId;
+    } catch (e) {
+      console.error('Failed to resolve Spotify track:', e);
+      return null;
+    }
+  };
+
+  const handleSelectTrack = async (trackData: any) => {
+    showToast(`Loading: ${trackData.title}...`);
+    
+    const videoId = await resolveSpotifyTrack(trackData);
+    if (!videoId) {
+      showToast("Failed to find track on YouTube");
+      return;
+    }
+
     const newTrack: Track = {
-      id: trackData.youtubeId || trackData.id,
+      id: videoId,
       title: trackData.title,
       artist: trackData.artist,
-      url: `/api/stream/${trackData.youtubeId || trackData.id}`,
+      url: `/api/stream/${videoId}`,
       cover: trackData.cover,
       duration: trackData.duration || 0,
-      source: 'youtube',
-      youtubeId: trackData.youtubeId || trackData.id,
+      source: trackData.spotifyId ? 'spotify' : 'youtube',
+      youtubeId: videoId,
+      spotifyId: trackData.spotifyId,
     };
 
     if (isHost) {
@@ -413,16 +443,25 @@ export const Room: React.FC<RoomProps> = ({ roomId, userName, onLeave, roomType,
     setIsDrawerOpen(false);
   };
   
-  const handleAddToQueue = (trackData: any) => {
+  const handleAddToQueue = async (trackData: any) => {
+    showToast(`Resolving: ${trackData.title}...`);
+    
+    const videoId = await resolveSpotifyTrack(trackData);
+    if (!videoId) {
+      showToast("Failed to find track");
+      return;
+    }
+
     const newTrack: Track = {
-      id: trackData.youtubeId || trackData.id,
+      id: videoId,
       title: trackData.title,
       artist: trackData.artist,
-      url: `/api/stream/${trackData.youtubeId || trackData.id}`,
+      url: `/api/stream/${videoId}`,
       cover: trackData.cover,
       duration: trackData.duration || 0,
-      source: 'youtube',
-      youtubeId: trackData.youtubeId || trackData.id,
+      source: trackData.spotifyId ? 'spotify' : 'youtube',
+      youtubeId: videoId,
+      spotifyId: trackData.spotifyId,
     };
     emit.addToQueue(newTrack);
     showToast("Added to queue");

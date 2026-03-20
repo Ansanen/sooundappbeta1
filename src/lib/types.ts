@@ -5,8 +5,10 @@ export interface Track {
   url: string;
   cover: string;
   duration?: number;
-  source?: 'youtube' | 'upload' | 'default';
+  source?: 'youtube' | 'upload' | 'default' | 'spotify';
   youtubeId?: string;
+  spotifyId?: string;
+  album?: string;
   requestedBy?: string;
 }
 

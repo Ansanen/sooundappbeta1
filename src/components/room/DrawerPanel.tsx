@@ -167,9 +167,20 @@ export const DrawerPanel: React.FC<DrawerPanelProps> = ({
         const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        const results = data.results || [];
+        // Support both Spotify (tracks) and YouTube (results) responses
+        const results = (data.tracks || data.results || []).map((t: any) => ({
+          id: t.spotifyId || t.youtubeId || t.id,
+          spotifyId: t.spotifyId,
+          youtubeId: t.youtubeId,
+          title: t.title,
+          artist: t.artist,
+          album: t.album,
+          cover: t.cover || t.thumbnail,
+          duration: t.spotifyId ? (t.duration / 1000) : (t.duration || 0), // Spotify is ms, convert to sec
+          durationMs: t.duration,
+          source: t.spotifyId ? 'spotify' : 'youtube',
+        }));
         setSearchResults(results);
-        // Only save to recent if we got results
         if (results.length > 0) {
           addRecentSearch(searchQuery.trim());
           setRecentSearches(getRecentSearches());
@@ -318,8 +329,8 @@ export const DrawerPanel: React.FC<DrawerPanelProps> = ({
               ) : !searchQuery ? (
                 <div className="h-full flex flex-col items-center justify-center text-white/30 space-y-4 pt-12">
                     <IconSearch className="w-16 h-16 opacity-20" />
-                    <p className="font-display text-lg">Search any song on YouTube</p>
-                    <p className="font-display text-sm text-white/20">Full tracks, any artist</p>
+                    <p className="font-display text-lg">Search any song</p>
+                    <p className="font-display text-sm text-white/20">Powered by Spotify + YouTube</p>
                 </div>
               ) : null}
             </div>
